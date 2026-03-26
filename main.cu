@@ -53,7 +53,11 @@
     } while (0)
 
 
-
+#if __CUDA_ARCH__ >= 700
+    #define BALLOT(mask, pred) __ballot_sync(mask, pred)
+#else
+    #define BALLOT(mask, pred) __ballot(pred)   // mask is ignored on <7.0
+#endif
 
 
 // 16-byte alignment → single LDG.128 instruction per point load on GPU.
@@ -407,7 +411,8 @@ __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ p
         bool changed = (assignments[i] != best_c);
         if (changed) assignments[i] = best_c;
 
-        unsigned mask = __ballot_sync(0xFFFFFFFF, changed);
+        // unsigned mask = __ballot_sync(0xFFFFFFFF, changed);
+        unsigned mask = BALLOT(0xFFFFFFFF, changed);
         if (mask != 0 && (__ffs(mask) - 1 == (threadIdx.x % 32))) atomicOr(d_changed, 1); 
 
         int idx = warp_id * k + best_c;
@@ -804,10 +809,10 @@ int main(int argc, char** argv) {
     else {
         fprintf(stderr, "Unknown mode '%s'. Expected: knn | approx_knn | kmeans\n",
                 mode);
-        free(h_pts);
+        cudaFreeHost(h_pts);
         return EXIT_FAILURE;
     }
 
-    free(h_pts);
+    cudaFreeHost(h_pts);
     return 0;
 }
