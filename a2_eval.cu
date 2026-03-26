@@ -42,7 +42,7 @@
 #define BLOCK_SZ          256   // threads per block (all kernels)
 #define MAX_K             128   // compile-time cap on k; sizes per-thread heap
 #define HIST_BINS         256   // intensity range [0, 255]
-#define APPROX_WIN_FACTOR  32   // approx window W = APPROX_WIN_FACTOR * k
+#define APPROX_WIN_FACTOR  16   // approx window W = APPROX_WIN_FACTOR * k
 
 // ─── CUDA error guard ─────────────────────────────────────────────────────────
 #define CUDA_CHECK(call)                                                        \
@@ -55,14 +55,7 @@
         }                                                                       \
     } while (0)
 
-
-#if __CUDA_ARCH__ >= 700
-    #define BALLOT(mask, pred) __ballot_sync(mask, pred)
-#else
-    #define BALLOT(mask, pred) __ballot(pred)   // mask is ignored on <7.0
-#endif
-
-
+    
 // 16-byte alignment → single LDG.128 instruction per point load on GPU.
 struct __align__(16) Point {
     int x, y, z, intensity;
@@ -96,7 +89,7 @@ bool is_worse(const HeapEntry& a, const HeapEntry& b) {
     if (a.dist2 != b.dist2) return a.dist2 > b.dist2;
     if (a.x     != b.x)     return a.x     > b.x;
     if (a.y     != b.y)     return a.y     > b.y;
-    return                         a.z     > b.z;
+    return a.z > b.z;
 }
 
 __device__
@@ -134,6 +127,7 @@ __device__ __forceinline__
 int equalize_from_neighbors(const Point* pts, const int* neighbors,
                              int k, int self_intensity) {
     int hist[HIST_BINS] = {0};
+    hist[self_intensity]++;
 
     for (int j = 0; j < k; j++)
         ++hist[pts[neighbors[j]].intensity];
@@ -146,8 +140,8 @@ int equalize_from_neighbors(const Point* pts, const int* neighbors,
         if (v == self_intensity)          cdf_self = cumsum;
     }
     if (total == cdf_min) return self_intensity;
-    return (int)roundf((float)(cdf_self - cdf_min) / (float)(total - cdf_min) * 255.0f);
-}
+    int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (total - cdf_min));
+    return max(0, min(255, val));}
 
 
 
@@ -200,7 +194,7 @@ __global__ void knn_kernel(const Point* __restrict__ pts, int n, int k,
 
                 if (cnt < k) {
                     best[cnt] = e;
-                    if (cnt == 0 || is_worse(e, best[worst_i])) {
+                    if (cnt == 0 || is_worse(best[cnt], best[worst_i])) {
                         worst_i = cnt;
                     }
                     cnt++;
@@ -240,11 +234,11 @@ __global__ void knn_kernel(const Point* __restrict__ pts, int n, int k,
     if (total == cdf_min) {
         out_intensity[qi] = q.intensity;
     } else {
-        float val = (float)(cdf_self - cdf_min) / (float)(total - cdf_min) * 255.0f;
-        out_intensity[qi] = (int)roundf(val);
+        // Use exact integer math with bounds clamping
+        int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (total - cdf_min));
+        out_intensity[qi] = max(0, min(255, val));
     }
 }
-
 
 
 
@@ -419,11 +413,10 @@ __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ p
         }
 
         bool changed = (assignments[i] != best_c);
-        if (changed) assignments[i] = best_c;
-
-        // unsigned mask = __ballot_sync(0xFFFFFFFF, changed);
-        unsigned mask = BALLOT(0xFFFFFFFF, changed);
-        if (mask != 0 && (__ffs(mask) - 1 == (threadIdx.x % 32))) atomicOr(d_changed, 1); 
+        if (changed) {
+            assignments[i] = best_c;
+            atomicOr(d_changed, 1);
+        }
 
         int idx = warp_id * k + best_c;
         atomicAdd(&sx[idx], px);
@@ -667,8 +660,8 @@ static int equalize_knn_host(const Point* pts,
         if (v == self_intensity) cdf_self = cumsum;
     }
     if (total == cdf_min) return self_intensity;
-    return (int)roundf((float)(cdf_self - cdf_min) /
-                       (float)(total - cdf_min) * 255.0f);
+    int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (total - cdf_min));
+    return std::max(0, std::min(255, val));
 }
 
 static void seq_knn(const Point* pts, int n, int k, std::vector<int>& out) {
@@ -729,8 +722,8 @@ static int equalize_approx_host(const Point* pts,
         if (v == self_intensity) cdf_self = cumsum;
     }
     if (total == cdf_min) return self_intensity;
-    return (int)roundf((float)(cdf_self - cdf_min) /
-                       (float)(total - cdf_min) * 255.0f);
+    int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (total - cdf_min));
+    return std::max(0, std::min(255, val));
 }
 
 static void seq_approx_knn(const Point* pts, int n, int k, std::vector<int>& out) {
@@ -869,8 +862,8 @@ static void seq_kmeans(const Point* pts, int n, int k, int T, std::vector<int>& 
         if (m == cm) {
             out[i] = Ii;
         } else {
-            out[i] = (int)roundf((float)(cs - cm) / (float)(m - cm) * 255.0f);
-        }
+            int val = (int)(((long long)(cs - cm) * 255) / (m - cm));
+            out[i] = std::max(0, std::min(255, val));        }
     }
 }
 
@@ -1053,7 +1046,7 @@ __global__ void kdtree_knn_kernel(const Point* __restrict__ pts, const KDNode* _
         int second = (axis_dist <= 0) ? node.right : node.left;
 
         if (second != -1) {
-            if (heap_sz < k || (axis_dist * axis_dist) < heap[0].dist2) {
+            if (heap_sz < k || (axis_dist * axis_dist) <= heap[0].dist2) {
                 stack[stack_sz++] = second;
             }
         }
