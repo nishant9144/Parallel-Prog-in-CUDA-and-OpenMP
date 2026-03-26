@@ -918,6 +918,184 @@ static void run_kdtree_knn(const Point* h_pts, int n, int k) {
 }
 
 
+
+
+
+typedef struct {
+    int l, r;  // Left and right child indices
+    int ax;    // Split axis (0=x, 1=y, 2=z)
+    int id;    // Point index
+} ApproxKDNode;
+
+typedef struct {
+    int v, id;
+} SNode;
+
+static int cmp_sn(const void* a, const void* b) {
+    int va = ((SNode*)a)->v, vb = ((SNode*)b)->v;
+    return (va > vb) - (va < vb);
+}
+
+// Recursively builds the KD-Tree and returns the root index
+static int build_kd(ApproxKDNode* tree, const Point* pts, int* idxs, int st, int ed, int dep, int* t_cnt) {
+    if (st > ed) return -1;
+    
+    int ax = dep % 3;
+    int num = ed - st + 1;
+    
+    SNode* tmp = (SNode*)malloc((size_t)num * sizeof(SNode));
+    for (int i = 0; i < num; i++) {
+        tmp[i].id = idxs[st + i];
+        if      (ax == 0) tmp[i].v = pts[idxs[st + i]].x;
+        else if (ax == 1) tmp[i].v = pts[idxs[st + i]].y;
+        else              tmp[i].v = pts[idxs[st + i]].z;
+    }
+    
+    qsort(tmp, num, sizeof(SNode), cmp_sn);
+    for (int i = 0; i < num; i++) idxs[st + i] = tmp[i].id;
+    free(tmp);
+    
+    int mid = st + num / 2;
+    int curr = (*t_cnt)++;
+    
+    tree[curr].ax = ax;
+    tree[curr].id = idxs[mid];
+    tree[curr].l = build_kd(tree, pts, idxs, st, mid - 1, dep + 1, t_cnt);
+    tree[curr].r = build_kd(tree, pts, idxs, mid + 1, ed, dep + 1, t_cnt);
+    
+    return curr;
+}
+
+__global__ void approx_kd_kernel(const Point* __restrict__ pts, 
+                                 const ApproxKDNode* __restrict__ tree, 
+                                 int root, int n, int k, int max_v, 
+                                 int* __restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    Point q = pts[i];
+    
+    // Float heap saves registers on K40m
+    float kd[128]; 
+    int ki[128];
+    int cnt = 0, wP = 0;
+    float wD = 0.0f; 
+
+    int st[64]; 
+    int top = 0;
+    st[top] = root;
+    int vis = 0;
+
+    // Iterative tree traversal
+    while (top >= 0 && vis < max_v) {
+        int c = st[top--];
+        if (c == -1) continue;
+
+        ApproxKDNode node = tree[c];
+        vis++;
+        Point p = pts[node.id];
+
+        if (node.id != i) {
+            long long dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+            float d2 = (float)(dx*dx + dy*dy + dz*dz);
+            
+            if (cnt < k) {
+                kd[cnt] = d2; ki[cnt] = node.id; cnt++;
+                if (cnt == k) {
+                    wD = kd[0]; wP = 0;
+                    for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
+                }
+            } else if (d2 < wD) {
+                kd[wP] = d2; ki[wP] = node.id;
+                wD = kd[0]; wP = 0;
+                for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
+            }
+        }
+
+        long long diff = 0;
+        if      (node.ax == 0) diff = q.x - p.x;
+        else if (node.ax == 1) diff = q.y - p.y;
+        else                   diff = q.z - p.z;
+
+        int near_c = (diff <= 0) ? node.l : node.r;
+        int far_c  = (diff <= 0) ? node.r : node.l;
+
+        // Prune branches
+        if (cnt < k || (float)(diff * diff) <= wD) {
+            if (far_c != -1) st[++top] = far_c;
+        }
+        if (near_c != -1) st[++top] = near_c;
+    }
+
+    // Inline Equalization
+    int hist[256] = {0};
+    hist[q.intensity]++;
+    for (int t = 0; t < cnt; t++) hist[pts[ki[t]].intensity]++;
+    
+    int cdf[256]; cdf[0] = hist[0];
+    for (int v = 1; v < 256; v++) cdf[v] = cdf[v-1] + hist[v];
+    
+    int c_min = 0;
+    for (int v = 0; v < 256; v++) if (cdf[v] > 0) { c_min = cdf[v]; break; }
+    
+    int m = cnt + 1;
+    if (m == c_min || m == 0) { out[i] = q.intensity; return; }
+    
+    int val = (int)(((long long)(cdf[q.intensity] - c_min) * 255) / (m - c_min));
+    out[i] = val > 255 ? 255 : (val < 0 ? 0 : val);
+}
+
+static void run_approx_kdtree(const Point* h_pts, int n, int k) {
+    int* idxs = (int*)malloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) idxs[i] = i;
+
+    ApproxKDNode* h_tree = (ApproxKDNode*)malloc((size_t)n * sizeof(ApproxKDNode));
+    int t_cnt = 0;
+    int root = build_kd(h_tree, h_pts, idxs, 0, n - 1, 0, &t_cnt);
+
+    Point* d_pts;
+    ApproxKDNode* d_tree;
+    int* d_out;
+    CUDA_CHECK(cudaMalloc(&d_pts,  (size_t)n * sizeof(Point)));
+    CUDA_CHECK(cudaMalloc(&d_tree, (size_t)n * sizeof(ApproxKDNode)));
+    CUDA_CHECK(cudaMalloc(&d_out,  (size_t)n * sizeof(int)));
+
+    CUDA_CHECK(cudaMemcpy(d_pts,  h_pts,  (size_t)n * sizeof(Point),  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tree, h_tree, (size_t)n * sizeof(ApproxKDNode), cudaMemcpyHostToDevice));
+
+    // Limit backtracking to maintain O(log N) speed
+    int max_v = k * 5; 
+    if (max_v < 128) max_v = 128;
+
+    int blk = 128; // Small block size prevents L1 spills during stack traversal
+    int grd = (n + blk - 1) / blk;
+
+    approx_kd_kernel<<<grd, blk>>>(d_pts, d_tree, root, n, k, max_v, d_out);
+    
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int* h_out = (int*)malloc((size_t)n * sizeof(int));
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Write results
+    FILE* fout = fopen("approx_kdtree.txt", "w");
+    if (fout) {
+        for (int i = 0; i < n; i++) {
+            fprintf(fout, "%d %d %d %d\n", h_pts[i].x, h_pts[i].y, h_pts[i].z, h_out[i]);
+        }
+        fclose(fout);
+    }
+
+    cudaFree(d_pts); cudaFree(d_tree); cudaFree(d_out);
+    free(idxs); free(h_tree); free(h_out);
+}
+
+
+
+
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SECTION 8 — SEQUENTIAL REFERENCE + EVAL  (host-side, unchanged from original)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1183,28 +1361,34 @@ static void run_eval(const Point* h_pts, int n, int k, int T) {
     for (int i = 0; i < warmup; ++i) run_knn(h_pts, n, k);
     double t0 = now_sec(); run_knn(h_pts, n, k);
     double gpu_knn_time = now_sec() - t0;
-    printf("  KNN    : %.3f s\n", gpu_knn_time);
+    printf("  KNN           : %.3f s\n", gpu_knn_time);
 
     for (int i = 0; i < warmup; ++i) run_approx_knn(h_pts, n, k);
     t0 = now_sec(); run_approx_knn(h_pts, n, k);
     double gpu_approx_time = now_sec() - t0;
-    printf("  Approx : %.3f s\n", gpu_approx_time);
+    printf("  Approx        : %.3f s\n", gpu_approx_time);
 
     for (int i = 0; i < warmup; ++i) run_kdtree_knn(h_pts, n, k);
     t0 = now_sec(); run_kdtree_knn(h_pts, n, k);
     double gpu_kdtree_time = now_sec() - t0;
-    printf("  KDTree : %.3f s\n", gpu_kdtree_time);
+    printf("  KDTree        : %.3f s\n", gpu_kdtree_time);
+
+    for (int i = 0; i < warmup; ++i) run_approx_kdtree(h_pts, n, k);
+    t0 = now_sec(); run_approx_kdtree(h_pts, n, k);
+    double gpu_approx_kd_time = now_sec() - t0;
+    printf("  Approx KDTree : %.3f s\n", gpu_approx_kd_time);
 
     for (int i = 0; i < warmup; ++i) run_kmeans(h_pts, n, k, T);
     t0 = now_sec(); run_kmeans(h_pts, n, k, T);
     double gpu_kmeans_time = now_sec() - t0;
-    printf("  KMeans : %.3f s\n", gpu_kmeans_time);
+    printf("  KMeans        : %.3f s\n", gpu_kmeans_time);
 
-    std::vector<int> gpu_knn_out, gpu_approx_out, gpu_kdtree_out, gpu_kmeans_out;
-    if (!read_output("knn.txt",        gpu_knn_out,    n) ||
-        !read_output("approx_knn.txt", gpu_approx_out, n) ||
-        !read_output("kdtree_knn.txt", gpu_kdtree_out, n) ||
-        !read_output("kmeans.txt",     gpu_kmeans_out, n)) {
+    std::vector<int> gpu_knn_out, gpu_approx_out, gpu_kdtree_out, gpu_approx_kd_out, gpu_kmeans_out;
+    if (!read_output("knn.txt",           gpu_knn_out,       n) ||
+        !read_output("approx_knn.txt",    gpu_approx_out,    n) ||
+        !read_output("kdtree_knn.txt",    gpu_kdtree_out,    n) ||
+        !read_output("approx_kdtree.txt", gpu_approx_kd_out, n) ||
+        !read_output("kmeans.txt",        gpu_kmeans_out,    n)) {
         fprintf(stderr, "Failed reading GPU outputs for evaluation.\n");
         return;
     }
@@ -1228,17 +1412,19 @@ static void run_eval(const Point* h_pts, int n, int k, int T) {
     printf("  KMeans : %.3f s\n", seq_kmeans_time);
 
     printf("\n[ Correctness ]\n");
-    print_cmp("seq_knn vs knn.txt",       compare_outputs(seq_knn_out,    gpu_knn_out),    true);
-    print_cmp("seq_knn vs kdtree_knn.txt",compare_outputs(seq_knn_out,    gpu_kdtree_out), true);
-    print_cmp("knn.txt vs approx_knn.txt",compare_outputs(gpu_knn_out,    gpu_approx_out), false);
-    print_cmp("seq_approx vs approx_knn", compare_outputs(seq_approx_out, gpu_approx_out), true);
-    print_cmp("seq_kmeans vs kmeans.txt", compare_outputs(seq_kmeans_out, gpu_kmeans_out), false);
+    print_cmp("seq_knn vs knn.txt",          compare_outputs(seq_knn_out,    gpu_knn_out),       true);
+    print_cmp("seq_knn vs kdtree_knn.txt",   compare_outputs(seq_knn_out,    gpu_kdtree_out),    true);
+    print_cmp("knn.txt vs approx_knn.txt",   compare_outputs(gpu_knn_out,    gpu_approx_out),    false);
+    print_cmp("knn.txt vs approx_kdtree.txt",compare_outputs(gpu_knn_out,    gpu_approx_kd_out), false);
+    print_cmp("seq_approx vs approx_knn",    compare_outputs(seq_approx_out, gpu_approx_out),    true);
+    print_cmp("seq_kmeans vs kmeans.txt",    compare_outputs(seq_kmeans_out, gpu_kmeans_out),    false);
 
     printf("\n[ Speedup Summary ]\n");
-    printf("  KNN    speedup (seq/gpu): %.2fx\n", seq_knn_time    / gpu_knn_time);
-    printf("  KDTree speedup (seq/gpu): %.2fx\n", seq_knn_time    / gpu_kdtree_time);
-    printf("  Approx speedup (seq/gpu): %.2fx\n", seq_approx_time / gpu_approx_time);
-    printf("  KMeans speedup (seq/gpu): %.2fx\n", seq_kmeans_time / gpu_kmeans_time);
+    printf("  KNN           speedup (seq/gpu): %.2fx\n", seq_knn_time    / gpu_knn_time);
+    printf("  KDTree        speedup (seq/gpu): %.2fx\n", seq_knn_time    / gpu_kdtree_time);
+    printf("  Approx KDTree speedup (seq/gpu): %.2fx\n", seq_knn_time    / gpu_approx_kd_time);
+    printf("  Approx        speedup (seq/gpu): %.2fx\n", seq_approx_time / gpu_approx_time);
+    printf("  KMeans        speedup (seq/gpu): %.2fx\n", seq_kmeans_time / gpu_kmeans_time);
 }
 
 
@@ -1262,6 +1448,7 @@ int main(int argc, char** argv) {
     else if (strcmp(mode, "approx_knn") == 0) run_approx_knn(h_pts, n, k);
     else if (strcmp(mode, "kdtree")     == 0) run_kdtree_knn(h_pts, n, k);
     else if (strcmp(mode, "kmeans")     == 0) run_kmeans(h_pts, n, k, T);
+    else if (strcmp(mode, "approx_kdtree") == 0) run_approx_kdtree(h_pts, n, k);
     else if (strcmp(mode, "eval")       == 0) run_eval(h_pts, n, k, T);
     else {
         fprintf(stderr, "Unknown mode '%s'. Expected: knn|approx_knn|kdtree|kmeans|eval\n",
