@@ -13,11 +13,11 @@
 #include <utility>
 #include <vector>
 
-// ─── Tunable constants ────────────────────────────────────────────────────────
-#define BLOCK_SZ          256   // default for all kernels that don't spill
-#define KNN_BLOCK_SZ      128   // [K40m] knn + kdtree: halves register demand
-#define MAX_K             128   // compile-time cap on k
-#define HIST_BINS         256   // intensity range [0, 255]
+// ─── Constants ────────────────────────────────────────────────────────
+#define BLOCK_SZ          256
+#define KNN_BLOCK_SZ      128
+#define MAX_K             128
+#define HIST_BINS         256
 
 // ─── CUDA error guard ─────────────────────────────────────────────────────────
 #define CUDA_CHECK(call)                                                        \
@@ -31,17 +31,16 @@
     } while (0)
 
 struct __align__(16) Point {
-    int x, y, z, intensity;
+    int x, y, z, I;
 };
 
-struct HeapEntry {
+struct HeapNode {
     int64_t dist2;
     int     x, y, z;
     int     idx;
 };
 
-// ─── KD-Tree Structures ───────────────────────────────────────────────────────
-struct KDNode {
+struct TreeNode {
     int pt_idx;
     int left, right;
     int axis;
@@ -54,7 +53,7 @@ int64_t sq_dist(const Point& a, const Point& b) {
 }
 
 __device__ __forceinline__
-bool is_worse(const HeapEntry& a, const HeapEntry& b) {
+bool is_worse(const HeapNode& a, const HeapNode& b) {
     if (a.dist2 != b.dist2) return a.dist2 > b.dist2;
     if (a.x     != b.x)     return a.x     > b.x;
     if (a.y     != b.y)     return a.y     > b.y;
@@ -62,46 +61,45 @@ bool is_worse(const HeapEntry& a, const HeapEntry& b) {
 }
 
 __device__
-void heap_push(HeapEntry* heap, int& sz, const HeapEntry& e) {
+void heap_push(HeapNode* heap, int& sz, const HeapNode& e) {
     int i = sz++;
     heap[i] = e;
     while (i > 0) {
         int par = (i - 1) >> 1;
         if (!is_worse(heap[i], heap[par])) break;
-        HeapEntry tmp = heap[par]; heap[par] = heap[i]; heap[i] = tmp;
+        HeapNode tmp = heap[par]; heap[par] = heap[i]; heap[i] = tmp;
         i = par;
     }
 }
 
 __device__
-void heapify_down(HeapEntry* heap, int sz) {
+void heapify_down(HeapNode* heap, int sz) {
     int i = 0;
     while (true) {
         int worst = i, l = 2*i + 1, r = 2*i + 2;
         if (l < sz && is_worse(heap[l], heap[worst])) worst = l;
         if (r < sz && is_worse(heap[r], heap[worst])) worst = r;
         if (worst == i) break;
-        HeapEntry tmp = heap[worst]; heap[worst] = heap[i]; heap[i] = tmp;
+        HeapNode tmp = heap[worst]; heap[worst] = heap[i]; heap[i] = tmp;
         i = worst;
     }
 }
 
 __device__ __forceinline__
-int equalize_from_neighbors(const Point* pts, const int* neighbors,
-                             int k, int self_intensity) {
+int equalize(const Point* pts, const int* neighbors, int k, int self_I) {
     uint8_t hist[HIST_BINS] = {};
-    hist[self_intensity]++;
+    hist[self_I]++;
     for (int j = 0; j < k; j++)
-        ++hist[pts[neighbors[j]].intensity];
+        ++hist[pts[neighbors[j]].I];
 
     int total = k + 1;
     int cumsum = 0, cdf_min = 0, cdf_self = 0;
     for (int v = 0; v < HIST_BINS; v++) {
         cumsum += hist[v];
         if (cdf_min  == 0 && cumsum > 0) cdf_min  = cumsum;
-        if (v == self_intensity)         cdf_self = cumsum;
+        if (v == self_I)         cdf_self = cumsum;
     }
-    if (total == cdf_min) return self_intensity;
+    if (total == cdf_min) return self_I;
     int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (total - cdf_min));
     return max(0, min(255, val));
 }
@@ -190,17 +188,16 @@ __global__ void approx_knn_kernel(
 
 __constant__ int4 dc_cent[128]; 
 
-__global__ void kmeans_assign_and_accumulate_kernel(
+__global__ void asgn_cluster(
     const Point* __restrict__ pts,
     int n, int k,
     int* __restrict__ asgn,
     int* __restrict__ changed,
-    int* __restrict__ acx,  // Changed to int*
-    int* __restrict__ acy,  // Changed to int*
-    int* __restrict__ acz,  // Changed to int*
+    int* __restrict__ acx,
+    int* __restrict__ acy,
+    int* __restrict__ acz,
     int* __restrict__ acnt)
 {
-    // Shared memory must also be cast to int* on the host launch
     extern __shared__ int smem[];
     const int n_warp = blockDim.x / 32;
     const int w_id   = threadIdx.x / 32;
@@ -210,23 +207,22 @@ __global__ void kmeans_assign_and_accumulate_kernel(
     int* sz = smem + 2 * n_warp * k;
     int* sc = smem + 3 * n_warp * k;
 
-    for (int t = threadIdx.x; t < n_warp * k; t += blockDim.x) {
+    for (int t = threadIdx.x; t < n_warp * k; t += blockDim.x) 
         sx[t] = sy[t] = sz[t] = sc[t] = 0;
-    }
+    
     __syncthreads();
 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         Point p = pts[i];
         int bC = 0;
-        long long bD = 9223372036854775807LL; // LLONG_MAX
+        long long bD = LLONG_MAX; 
 
         for (int c = 0; c < k; c++) {
             int4 cent = dc_cent[c];
             long long dx = p.x - cent.x, dy = p.y - cent.y, dz = p.z - cent.z;
             long long d2 = dx*dx + dy*dy + dz*dz;
 
-            // Strict deterministic tie-breaker matching Kernel 1
             bool rep = false;
             if (d2 < bD) {
                 rep = true;
@@ -273,7 +269,7 @@ __global__ void kmeans_assign_and_accumulate_kernel(
     }
 }
 
-__global__ void kmeans_finalize_kernel(
+__global__ void km_update(
     int4* __restrict__ centroids,
     const int* __restrict__ acx,
     const int* __restrict__ acy,
@@ -284,13 +280,14 @@ __global__ void kmeans_finalize_kernel(
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= k) return;
     if (acnt[c] > 0) {
-        // Integer division enforces truncation, preventing cluster drift
         centroids[c] = { acx[c] / acnt[c],
                          acy[c] / acnt[c],
-                         acz[c] / acnt[c], 0 };
+                         acz[c] / acnt[c], 
+                         0 
+                        };
     }
 }
-__global__ void kmeans_hist_kernel(const Point* __restrict__ pts,
+__global__ void km_hist(const Point* __restrict__ pts,
                                     const int*   __restrict__ assignments,
                                     int n,
                                     int* __restrict__ cluster_hist)
@@ -301,16 +298,15 @@ __global__ void kmeans_hist_kernel(const Point* __restrict__ pts,
     bool valid = (i < n);
     if (valid) {
         cluster   = assignments[i];
-        intensity = pts[i].intensity;
+        intensity = pts[i].I;
     }
 
     unsigned mask = __ballot_sync(0xFFFFFFFF, valid);
     if (!valid) return;
 
     int lane = threadIdx.x & 31;
-    int key  = (cluster << 8) | intensity;  // pack for comparison
+    int key  = (cluster << 8) | intensity;
 
-    // Find the lowest lane with the same key and let it accumulate.
     int count = 0;
     unsigned remaining = mask;
     while (remaining) {
@@ -325,7 +321,7 @@ __global__ void kmeans_hist_kernel(const Point* __restrict__ pts,
     }
 }
 
-__global__ void compute_cdf_kernel(const int* __restrict__ cluster_hist,
+__global__ void cdf(const int* __restrict__ cluster_hist,
                                    int k,
                                    int* __restrict__ cdf,
                                    int* __restrict__ cdf_min,
@@ -347,31 +343,29 @@ __global__ void compute_cdf_kernel(const int* __restrict__ cluster_hist,
     cluster_sz[c] = sum;
 }
 
-__global__ void equalize_kmeans_kernel(const Point* __restrict__ pts,
-                                        const int*   __restrict__ assignments,
+__global__ void km_equalize(const Point* __restrict__ pts,
+                                        const int*   __restrict__ asgn,
                                         const int*   __restrict__ cdf,
                                         const int*   __restrict__ cdf_min,
                                         const int*   __restrict__ cluster_sz,
                                         int n,
-                                        int* __restrict__ out_intensity)
+                                        int* __restrict__ out_I)
 {
     int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
     if (i >= n) return;
 
-    int c  = assignments[i];
-    int Ii = pts[i].intensity;
+    int c  = asgn[i];
+    int Ii = pts[i].I;
 
     int cdf_self = cdf[c * HIST_BINS + Ii];
     int cm       = cdf_min[c];
     int m        = cluster_sz[c];
 
     if (m == cm) {
-        out_intensity[i] = Ii;
+        out_I[i] = Ii;
     } else {
         int val = (int)(((long long)(cdf_self - cm) * 255) / (m - cm));
-        out_intensity[i] = max(0, min(255, val));
-        // float val = (float)(cdf_self - cm) / (float)(m - cm) * 255.0f;
-        // out_intensity[i] = (int)roundf(val);
+        out_I[i] = max(0, min(255, val));
     }
 }
 
@@ -383,15 +377,15 @@ __global__ void equalize_kmeans_kernel(const Point* __restrict__ pts,
 
 
 
-__global__ void kdtree_knn_kernel(const Point* __restrict__ pts,
-                                   const KDNode* __restrict__ tree,
+__global__ void knn(const Point* __restrict__ pts,
+                                   const TreeNode* __restrict__ tree,
                                    int root, int n, int k,
-                                   int* __restrict__ out_intensity) {
+                                   int* __restrict__ out_I) {
     int qi = blockIdx.x * KNN_BLOCK_SZ + threadIdx.x;
     if (qi >= n) return;
 
     Point q = pts[qi];
-    HeapEntry heap[MAX_K];
+    HeapNode heap[MAX_K];
     int heap_sz = 0;
 
     int stack[32];
@@ -402,14 +396,14 @@ __global__ void kdtree_knn_kernel(const Point* __restrict__ pts,
         int curr = stack[--stack_sz];
         if (curr == -1) continue;
 
-        KDNode node = tree[curr];
+        TreeNode node = tree[curr];
         Point  p    = pts[node.pt_idx];
 
         if (node.pt_idx != qi) {
             int64_t dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
             int64_t d2 = dx*dx + dy*dy + dz*dz;
 
-            HeapEntry e = { d2, p.x, p.y, p.z, node.pt_idx };
+            HeapNode e = { d2, p.x, p.y, p.z, node.pt_idx };
 
             if (heap_sz < k) {
                 heap_push(heap, heap_sz, e);
@@ -436,7 +430,7 @@ __global__ void kdtree_knn_kernel(const Point* __restrict__ pts,
     int neighbors[MAX_K];
     for (int j = 0; j < heap_sz; j++) neighbors[j] = heap[j].idx;
 
-    out_intensity[qi] = equalize_from_neighbors(pts, neighbors, heap_sz, q.intensity);
+    out_I[qi] = equalize(pts, neighbors, heap_sz, q.I);
 }
 
 
@@ -458,7 +452,7 @@ static void read_input(const char* path, Point** h_pts, int* n, int* k, int* T) 
     for (int i = 0; i < *n; i++) {
         if (fscanf(f, "%d %d %d %d",
                    &(*h_pts)[i].x, &(*h_pts)[i].y,
-                   &(*h_pts)[i].z, &(*h_pts)[i].intensity) != 4) {
+                   &(*h_pts)[i].z, &(*h_pts)[i].I) != 4) {
             fprintf(stderr, "Truncated input at point %d\n", i);
             exit(EXIT_FAILURE);
         }
@@ -479,15 +473,6 @@ static void write_output(const char* path,
 }
 
 
-
-
-
-// Forward declarations (needed by run_eval).
-static void run_approx_knn(const Point* h_pts, int n, int k);
-static void run_kdtree_knn(const Point* h_pts, int n, int k);
-static void run_kmeans(const Point* h_pts, int n, int k, int T);
-
-// Struct and comparator for sorting points by grid cell
 typedef struct {
     int cell;
     int idx;
@@ -554,7 +539,7 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
         px[i]   = h_pts[oi].x;
         py[i]   = h_pts[oi].y;
         pz[i]   = h_pts[oi].z;
-        pI[i]   = h_pts[oi].intensity;
+        pI[i]   = h_pts[oi].I;
         orig[i] = oi;
     }
 
@@ -607,7 +592,8 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
 
 
 static void run_kmeans(const Point* h_pts, int n, int k, int T) {
-    int4* h_centroids = (int4*)malloc((size_t)k * sizeof(int4));
+    int4* h_centroids;
+    CUDA_CHECK(cudaMallocHost(&h_centroids, (size_t)k * sizeof(int4)));
     for (int c = 0; c < k; c++)
         h_centroids[c] = { h_pts[c].x, h_pts[c].y, h_pts[c].z, 0 };
 
@@ -640,7 +626,7 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
     CUDA_CHECK(cudaMemset(d_assignments, 0, (size_t)n * sizeof(int)));
 
     CUDA_CHECK(cudaFuncSetCacheConfig(
-        kmeans_assign_and_accumulate_kernel, cudaFuncCachePreferShared));
+        asgn_cluster, cudaFuncCachePreferShared));
 
     int grid      = (n + BLOCK_SZ - 1) / BLOCK_SZ;
     int k_grid    = (k + BLOCK_SZ - 1) / BLOCK_SZ;
@@ -661,7 +647,7 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
                                            (size_t)k * sizeof(int4), 0,
                                            cudaMemcpyDeviceToDevice));
 
-        kmeans_assign_and_accumulate_kernel<<<grid, BLOCK_SZ, smem_size>>>(
+        asgn_cluster<<<grid, BLOCK_SZ, smem_size>>>(
             d_pts, n, k, d_assignments, d_changed,
             d_accum_cx, d_accum_cy, d_accum_cz, d_accum_cnt);
         CUDA_CHECK(cudaGetLastError());
@@ -670,7 +656,7 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
                               cudaMemcpyDeviceToHost));
         if (!h_changed && iter > 0) break;
 
-        kmeans_finalize_kernel<<<k_grid, BLOCK_SZ>>>(
+        km_update<<<k_grid, BLOCK_SZ>>>(
             d_centroids, d_accum_cx, d_accum_cy, d_accum_cz, d_accum_cnt, k);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -682,21 +668,22 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
     CUDA_CHECK(cudaMalloc(&d_cdf_min, (size_t)k             * sizeof(int)));
     CUDA_CHECK(cudaMemset(d_cluster_hist, 0, (size_t)k * HIST_BINS * sizeof(int)));
 
-    kmeans_hist_kernel<<<grid, BLOCK_SZ>>>(d_pts, d_assignments, n, d_cluster_hist);
+    km_hist<<<grid, BLOCK_SZ>>>(d_pts, d_assignments, n, d_cluster_hist);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    compute_cdf_kernel<<<k_grid, BLOCK_SZ>>>(
+    cdf<<<k_grid, BLOCK_SZ>>>(
         d_cluster_hist, k, d_cdf, d_cdf_min, d_cluster_size);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    equalize_kmeans_kernel<<<grid, BLOCK_SZ>>>(
+    km_equalize<<<grid, BLOCK_SZ>>>(
         d_pts, d_assignments, d_cdf, d_cdf_min, d_cluster_size, n, d_out);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int* h_out = (int*)malloc((size_t)n * sizeof(int));
+    int* h_out;
+    CUDA_CHECK(cudaMallocHost(&h_out, (size_t)n * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(h_out, d_out, (size_t)n * sizeof(int),
                           cudaMemcpyDeviceToHost));
 
@@ -707,17 +694,14 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
     cudaFree(d_accum_cz);     cudaFree(d_accum_cnt);   cudaFree(d_cluster_hist);
     cudaFree(d_cluster_size); cudaFree(d_out);
     cudaFree(d_cdf);          cudaFree(d_cdf_min);
-    free(h_centroids); free(h_out);
+    CUDA_CHECK(cudaFreeHost(h_centroids));
+    CUDA_CHECK(cudaFreeHost(h_out));
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SECTION 7 — KD-TREE BUILD (CPU) + LAUNCH
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static int build_kdtree_rec(std::vector<int>& indices, const Point* pts,
+static int build_tree(std::vector<int>& indices, const Point* pts,
                              int start, int end, int depth,
-                             std::vector<KDNode>& nodes) {
+                             std::vector<TreeNode>& nodes) {
     if (start >= end) return -1;
 
     int axis = depth % 3;
@@ -734,33 +718,32 @@ static int build_kdtree_rec(std::vector<int>& indices, const Point* pts,
     int node_idx = nodes.size();
     nodes.push_back({indices[mid], -1, -1, axis});
 
-    nodes[node_idx].left  = build_kdtree_rec(indices, pts, start, mid, depth+1, nodes);
-    nodes[node_idx].right = build_kdtree_rec(indices, pts, mid+1, end, depth+1, nodes);
+    nodes[node_idx].left  = build_tree(indices, pts, start, mid, depth+1, nodes);
+    nodes[node_idx].right = build_tree(indices, pts, mid+1, end, depth+1, nodes);
     return node_idx;
 }
 
-static void run_kdtree_knn(const Point* h_pts, int n, int k) {
+static void run_knn(const Point* h_pts, int n, int k) {
     std::vector<int> indices(n);
     for (int i = 0; i < n; ++i) indices[i] = i;
 
-    std::vector<KDNode> tree_nodes;
+    std::vector<TreeNode> tree_nodes;
     tree_nodes.reserve(n);
-    int root = build_kdtree_rec(indices, h_pts, 0, n, 0, tree_nodes);
+    int root = build_tree(indices, h_pts, 0, n, 0, tree_nodes);
 
     Point*  d_pts;
-    KDNode* d_tree;
+    TreeNode* d_tree;
     int*    d_out;
     CUDA_CHECK(cudaMalloc(&d_pts,  (size_t)n * sizeof(Point)));
-    CUDA_CHECK(cudaMalloc(&d_tree, (size_t)n * sizeof(KDNode)));
+    CUDA_CHECK(cudaMalloc(&d_tree, (size_t)n * sizeof(TreeNode)));
     CUDA_CHECK(cudaMalloc(&d_out,  (size_t)n * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(d_pts,  h_pts,             (size_t)n * sizeof(Point),  cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tree, tree_nodes.data(), (size_t)n * sizeof(KDNode), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tree, tree_nodes.data(), (size_t)n * sizeof(TreeNode), cudaMemcpyHostToDevice));
 
-    // [K40m] L1 preference: kdtree_knn_kernel also spills heap[] to local memory.
-    CUDA_CHECK(cudaFuncSetCacheConfig(kdtree_knn_kernel, cudaFuncCachePreferL1));
+    CUDA_CHECK(cudaFuncSetCacheConfig(knn, cudaFuncCachePreferL1));
 
     int grid = (n + KNN_BLOCK_SZ - 1) / KNN_BLOCK_SZ;
-    kdtree_knn_kernel<<<grid, KNN_BLOCK_SZ>>>(d_pts, d_tree, root, n, k, d_out);
+    knn<<<grid, KNN_BLOCK_SZ>>>(d_pts, d_tree, root, n, k, d_out);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -785,7 +768,7 @@ int main(int argc, char** argv) {
     double start_time = omp_get_wtime();
 
     const char* mode = argv[2];
-    if      (strcmp(mode, "knn")        == 0) run_kdtree_knn(h_pts, n, k);
+    if      (strcmp(mode, "knn")        == 0) run_knn(h_pts, n, k);
     else if (strcmp(mode, "approx_knn") == 0) run_approx_knn(h_pts, n, k);
     else if (strcmp(mode, "kmeans")     == 0) run_kmeans(h_pts, n, k, T);
     else {
