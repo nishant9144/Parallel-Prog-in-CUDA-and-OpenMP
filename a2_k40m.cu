@@ -230,96 +230,81 @@ __global__ void knn_kernel(const Point* __restrict__ pts, int n, int k,
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SECTION 2 — APPROXIMATE KNN  (Morton Z-order + window search)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ uint32_t morton_expand_10bits(uint32_t v) {
-    v &= 0x000003FFu;
-    v = (v | (v << 16)) & 0x030000FFu;
-    v = (v | (v <<  8)) & 0x0300F00Fu;
-    v = (v | (v <<  4)) & 0x030C30C3u;
-    v = (v | (v <<  2)) & 0x09249249u;
-    return v;
-}
-
-__device__ __forceinline__ uint32_t morton3D(uint32_t x, uint32_t y, uint32_t z) {
-    return  morton_expand_10bits(x)
-         | (morton_expand_10bits(y) << 1)
-         | (morton_expand_10bits(z) << 2);
-}
-
-__global__ void compute_morton_kernel(const Point* __restrict__ pts, int n,
-                                       int xmin, int ymin, int zmin,
-                                       int xrange, int yrange, int zrange,
-                                       uint2* __restrict__ morton_pairs) {
-    int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
+__global__ void approx_knn_kernel(
+    const int* __restrict__ px, const int* __restrict__ py,
+    const int* __restrict__ pz, const int* __restrict__ pI,
+    const int* __restrict__ orig, int n,
+    const int* __restrict__ c_start, const int* __restrict__ c_cnt,
+    int Gx, int Gy, int Gz, int x_min, int y_min, int z_min, float inv_vs,
+    int k, int* __restrict__ out_I)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    uint32_t nx = xrange ? (uint32_t)((int64_t)(pts[i].x - xmin) * 1023 / xrange) : 0u;
-    uint32_t ny = yrange ? (uint32_t)((int64_t)(pts[i].y - ymin) * 1023 / yrange) : 0u;
-    uint32_t nz = zrange ? (uint32_t)((int64_t)(pts[i].z - zmin) * 1023 / zrange) : 0u;
-    morton_pairs[i] = { morton3D(nx, ny, nz), (uint32_t)i };
-}
+    int xi = px[i], yi = py[i], zi = pz[i];
+    int cx = min(Gx - 1, max(0, (int)((xi - x_min) * inv_vs)));
+    int cy = min(Gy - 1, max(0, (int)((yi - y_min) * inv_vs)));
+    int cz = min(Gz - 1, max(0, (int)((zi - z_min) * inv_vs)));
 
-__global__ void bitonic_sort_step(uint2* data, int n_padded, int step, int stage) {
-    int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
-    if (i >= n_padded) return;
+    // Float heap for low register usage, populated via exact integer math
+    float kd[128];
+    int ki[128];
+    int cnt = 0;
+    float wD = 0.0f; int wP = 0;
 
-    int j = i ^ step;
-    if (j <= i) return;
+    for (int r = 0; r <= 4; r++) {
+        int ax = max(0, cx - r), bx = min(Gx - 1, cx + r);
+        int ay = max(0, cy - r), by = min(Gy - 1, cy + r);
+        int az = max(0, cz - r), bz = min(Gz - 1, cz + r);
 
-    bool ascending = ((i & stage) == 0);
-    if ((data[i].x > data[j].x) == ascending) {
-        uint2 tmp = data[i]; data[i] = data[j]; data[j] = tmp;
-    }
-}
+        for (int gx = ax; gx <= bx; gx++)
+        for (int gy = ay; gy <= by; gy++)
+        for (int gz = az; gz <= bz; gz++) {
+            // Skip inner cells already checked in smaller radius
+            if (r > 0 && abs(gx - cx) < r && abs(gy - cy) < r && abs(gz - cz) < r) continue;
 
-__global__ void build_rank_kernel(const uint2* __restrict__ sorted_pairs,
-                                   int n, int* __restrict__ rank) {
-    int pos = blockIdx.x * BLOCK_SZ + threadIdx.x;
-    if (pos >= n) return;
-    rank[sorted_pairs[pos].y] = pos;
-}
+            int cid = gx * Gy * Gz + gy * Gz + gz;
+            int start = c_start[cid], c_count = c_cnt[cid];
 
-__global__ void approx_knn_kernel(const Point* __restrict__ pts,
-                                   const int*   __restrict__ rank,
-                                   const uint2* __restrict__ sorted_pairs,
-                                   int n, int k, int window,
-                                   int* __restrict__ out_intensity) {
-    int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
-    if (i >= n) return;
+            for (int t = start; t < start + c_count; t++) {
+                if (orig[t] == orig[i]) continue;
+                
+                long long dx = (long long)(px[t] - xi);
+                long long dy = (long long)(py[t] - yi);
+                long long dz = (long long)(pz[t] - zi);
+                float d = (float)(dx*dx + dy*dy + dz*dz);
 
-    Point q  = pts[i];
-    int   p  = rank[i];
-    int   lo = max(0, p - window / 2);
-    int   hi = min(n - 1, lo + window - 1);
-    lo       = max(0, hi - window + 1);
-
-    HeapEntry heap[MAX_K];
-    int heap_sz = 0;
-
-    for (int pos = lo; pos <= hi; pos++) {
-        int j = (int)sorted_pairs[pos].y;
-        if (j == i) continue;
-
-        // [K40m] Use __ldg for non-coalesced random reads through texture cache.
-        int4 raw = __ldg(reinterpret_cast<const int4*>(&pts[j]));
-        Point pj = { raw.x, raw.y, raw.z, raw.w };
-
-        int64_t dx = q.x - pj.x, dy = q.y - pj.y, dz = q.z - pj.z;
-        HeapEntry e = { dx*dx + dy*dy + dz*dz, pj.x, pj.y, pj.z, j };
-
-        if (heap_sz < k) {
-            heap_push(heap, heap_sz, e);
-        } else if (is_worse(heap[0], e)) {
-            heap[0] = e;
-            heapify_down(heap, heap_sz);
+                if (cnt < k) {
+                    kd[cnt] = d; ki[cnt] = t; ++cnt;
+                    if (cnt == k) {
+                        wD = kd[0]; wP = 0;
+                        for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
+                    }
+                } else if (d < wD) {
+                    kd[wP] = d; ki[wP] = t;
+                    wD = kd[0]; wP = 0;
+                    for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
+                }
+            }
         }
+        if (r >= 2 && cnt == k) break;
     }
 
-    int neighbors[MAX_K];
-    for (int j = 0; j < heap_sz; j++)
-        neighbors[j] = heap[j].idx;
+    int hist[256] = {0};
+    hist[pI[i]]++;
+    for (int t = 0; t < cnt; t++) hist[pI[ki[t]]]++;
 
-    out_intensity[i] = equalize_from_neighbors(pts, neighbors, heap_sz, q.intensity);
+    int cdf[256]; cdf[0] = hist[0];
+    for (int v = 1; v < 256; v++) cdf[v] = cdf[v - 1] + hist[v];
+
+    int cdf_min = 0;
+    for (int v = 0; v < 256; v++) if (cdf[v] > 0) { cdf_min = cdf[v]; break; }
+
+    int Ii = pI[i], m = cnt + 1;
+    if (m == cdf_min || m == 0) { out_I[orig[i]] = Ii; return; }
+    
+    int val = (int)(((long long)(cdf[Ii] - cdf_min) * 255) / (m - cdf_min));
+    out_I[orig[i]] = max(0, min(255, val));
 }
 
 
@@ -327,96 +312,109 @@ __global__ void approx_knn_kernel(const Point* __restrict__ pts,
 //  SECTION 3 — K-MEANS CLUSTERING
 // ═══════════════════════════════════════════════════════════════════════════════
 
-__constant__ float4 d_const_centroids[MAX_K];
+// Use int4 to strictly enforce integer centroids
+__constant__ int4 dc_cent[128]; 
 
-// [K40m] Launched with cudaFuncCachePreferShared (48 KB shared, 16 KB L1).
-//        Default Kepler config is 48 KB L1 / 16 KB shared; at k=128 this kernel
-//        needs exactly 16 KB shared, hitting the default limit. Flipping to
-//        prefer-shared avoids potential overflow and keeps atomics fast.
 __global__ void kmeans_assign_and_accumulate_kernel(
-    const Point*  __restrict__ pts,
+    const Point* __restrict__ pts,
     int n, int k,
-    int*   __restrict__ assignments,
-    int*   __restrict__ d_changed,
-    float* __restrict__ accum_cx,
-    float* __restrict__ accum_cy,
-    float* __restrict__ accum_cz,
-    int*   __restrict__ accum_cnt)
+    int* __restrict__ asgn,
+    int* __restrict__ changed,
+    int* __restrict__ acx,  // Changed to int*
+    int* __restrict__ acy,  // Changed to int*
+    int* __restrict__ acz,  // Changed to int*
+    int* __restrict__ acnt)
 {
-    extern __shared__ float smem[];
-    const int num_warps = blockDim.x / 32;
-    const int warp_id   = threadIdx.x / 32;
+    // Shared memory must also be cast to int* on the host launch
+    extern __shared__ int smem[];
+    const int n_warp = blockDim.x / 32;
+    const int w_id   = threadIdx.x / 32;
 
-    float* sx = smem;
-    float* sy = smem + num_warps * k;
-    float* sz = smem + 2 * num_warps * k;
-    int*   sc = (int*)(smem + 3 * num_warps * k);
+    int* sx = smem;
+    int* sy = smem + n_warp * k;
+    int* sz = smem + 2 * n_warp * k;
+    int* sc = smem + 3 * n_warp * k;
 
-    int total_elements = num_warps * k;
-    for (int t = threadIdx.x; t < total_elements; t += blockDim.x)
-        sx[t] = sy[t] = sz[t] = 0.0f, sc[t] = 0;
+    for (int t = threadIdx.x; t < n_warp * k; t += blockDim.x) {
+        sx[t] = sy[t] = sz[t] = sc[t] = 0;
+    }
     __syncthreads();
 
-    int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         Point p = pts[i];
-        float px = (float)p.x, py = (float)p.y, pz = (float)p.z;
-        int   best_c = -1;
-        float best_d = FLT_MAX;
+        int bC = 0;
+        long long bD = 9223372036854775807LL; // LLONG_MAX
 
         for (int c = 0; c < k; c++) {
-            float4 cent = d_const_centroids[c];
-            float dx = px - cent.x, dy = py - cent.y, dz = pz - cent.z;
-            float d2 = dx*dx + dy*dy + dz*dz;
-            if (d2 < best_d) { best_d = d2; best_c = c; }
+            int4 cent = dc_cent[c];
+            long long dx = p.x - cent.x, dy = p.y - cent.y, dz = p.z - cent.z;
+            long long d2 = dx*dx + dy*dy + dz*dz;
+
+            // Strict deterministic tie-breaker matching Kernel 1
+            bool rep = false;
+            if (d2 < bD) {
+                rep = true;
+            } else if (d2 == bD) {
+                int4 b_cent = dc_cent[bC];
+                if (cent.x < b_cent.x) rep = true;
+                else if (cent.x == b_cent.x) {
+                    if (cent.y < b_cent.y) rep = true;
+                    else if (cent.y == b_cent.y) {
+                        if (cent.z < b_cent.z) rep = true;
+                    }
+                }
+            }
+
+            if (rep) { bD = d2; bC = c; }
         }
 
-        bool changed = (assignments[i] != best_c);
-        if (changed) {
-            assignments[i] = best_c;
-            atomicOr(d_changed, 1);
+        if (asgn[i] != bC) {
+            asgn[i] = bC;
+            atomicOr(changed, 1);
         }
 
-        int idx = warp_id * k + best_c;
-        atomicAdd(&sx[idx], px);
-        atomicAdd(&sy[idx], py);
-        atomicAdd(&sz[idx], pz);
+        int idx = w_id * k + bC;
+        atomicAdd(&sx[idx], p.x);
+        atomicAdd(&sy[idx], p.y);
+        atomicAdd(&sz[idx], p.z);
         atomicAdd(&sc[idx], 1);
     }
     __syncthreads();
 
     for (int c = threadIdx.x; c < k; c += blockDim.x) {
-        float sum_x = 0, sum_y = 0, sum_z = 0;
-        int sum_c = 0;
-        for (int w = 0; w < num_warps; w++) {
+        int sum_x = 0, sum_y = 0, sum_z = 0, sum_c = 0;
+        for (int w = 0; w < n_warp; w++) {
             int idx = w * k + c;
             sum_x += sx[idx]; sum_y += sy[idx];
             sum_z += sz[idx]; sum_c += sc[idx];
         }
         if (sum_c > 0) {
-            atomicAdd(&accum_cx[c], sum_x);
-            atomicAdd(&accum_cy[c], sum_y);
-            atomicAdd(&accum_cz[c], sum_z);
-            atomicAdd(&accum_cnt[c], sum_c);
+            atomicAdd(&acx[c], sum_x);
+            atomicAdd(&acy[c], sum_y);
+            atomicAdd(&acz[c], sum_z);
+            atomicAdd(&acnt[c], sum_c);
         }
     }
 }
 
-__global__ void kmeans_finalize_kernel(float4*      __restrict__ centroids,
-                                        const float* __restrict__ accum_cx,
-                                        const float* __restrict__ accum_cy,
-                                        const float* __restrict__ accum_cz,
-                                        const int*   __restrict__ accum_cnt,
-                                        int k)
+__global__ void kmeans_finalize_kernel(
+    int4* __restrict__ centroids,
+    const int* __restrict__ acx,
+    const int* __restrict__ acy,
+    const int* __restrict__ acz,
+    const int* __restrict__ acnt,
+    int k)
 {
-    int c = blockIdx.x * BLOCK_SZ + threadIdx.x;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= k) return;
-    if (accum_cnt[c] > 0)
-        centroids[c] = { accum_cx[c] / accum_cnt[c],
-                         accum_cy[c] / accum_cnt[c],
-                         accum_cz[c] / accum_cnt[c], 0.0f };
+    if (acnt[c] > 0) {
+        // Integer division enforces truncation, preventing cluster drift
+        centroids[c] = { acx[c] / acnt[c],
+                         acy[c] / acnt[c],
+                         acz[c] / acnt[c], 0 };
+    }
 }
-
 __global__ void kmeans_hist_kernel(const Point* __restrict__ pts,
                                     const int*   __restrict__ assignments,
                                     int n,
@@ -507,9 +505,6 @@ __global__ void equalize_kmeans_kernel(const Point* __restrict__ pts,
 //  SECTION 4 — KD-TREE KNN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// [K40m] Launched with KNN_BLOCK_SZ=128 and cudaFuncCachePreferL1.
-//        heap[MAX_K] = 128 * 16 = 2 KB + stack[32] + scalars fits in registers
-//        better at 128 threads/block than 256.
 __global__ void kdtree_knn_kernel(const Point* __restrict__ pts,
                                    const KDNode* __restrict__ tree,
                                    int root, int n, int k,
@@ -641,89 +636,144 @@ static void run_knn(const Point* h_pts, int n, int k) {
     cudaFree(d_pts); cudaFree(d_out); free(h_out);
 }
 
+// Struct and comparator for sorting points by grid cell
+typedef struct {
+    int cell;
+    int idx;
+} SortItem;
+
+static int cmp_cells(const void* a, const void* b) {
+    int ca = ((const SortItem*)a)->cell;
+    int cb = ((const SortItem*)b)->cell;
+    return (ca > cb) - (ca < cb);
+}
+
 static void run_approx_knn(const Point* h_pts, int n, int k) {
-    int xmin = INT_MAX, xmax = INT_MIN;
-    int ymin = INT_MAX, ymax = INT_MIN;
-    int zmin = INT_MAX, zmax = INT_MIN;
-    #pragma omp parallel for schedule(static) \
-        reduction(min:xmin,ymin,zmin) reduction(max:xmax,ymax,zmax)
+    int xmn = h_pts[0].x, xmx = xmn, ymn = h_pts[0].y, ymx = ymn, zmn = h_pts[0].z, zmx = zmn;
+    
+    // Find bounding box
+    #pragma omp parallel for reduction(min:xmn,ymn,zmn) reduction(max:xmx,ymx,zmx)
     for (int i = 0; i < n; i++) {
-        xmin = std::min(xmin, h_pts[i].x); xmax = std::max(xmax, h_pts[i].x);
-        ymin = std::min(ymin, h_pts[i].y); ymax = std::max(ymax, h_pts[i].y);
-        zmin = std::min(zmin, h_pts[i].z); zmax = std::max(zmax, h_pts[i].z);
+        if (h_pts[i].x < xmn) xmn = h_pts[i].x;  if (h_pts[i].x > xmx) xmx = h_pts[i].x;
+        if (h_pts[i].y < ymn) ymn = h_pts[i].y;  if (h_pts[i].y > ymx) ymx = h_pts[i].y;
+        if (h_pts[i].z < zmn) zmn = h_pts[i].z;  if (h_pts[i].z > zmx) zmx = h_pts[i].z;
+    }
+    
+    float lx = (float)(xmx - xmn) + 1e-5f;
+    float ly = (float)(ymx - ymn) + 1e-5f;
+    float lz = (float)(zmx - zmn) + 1e-5f;
+
+    // Grid sizing heuristics
+    float mx_l = lx > ly ? (lx > lz ? lx : lz) : (ly > lz ? ly : lz);
+    float cpd = cbrtf(27.0f * n / (float)(k + 1));
+    if (cpd < 1.0f) cpd = 1.0f;
+    
+    float vs = mx_l / cpd;
+    if (vs < 1e-6f) vs = 1e-6f;
+
+    int Gx = (int)(lx / vs) + 1; if (Gx > 512) Gx = 512;
+    int Gy = (int)(ly / vs) + 1; if (Gy > 512) Gy = 512;
+    int Gz = (int)(lz / vs) + 1; if (Gz > 512) Gz = 512;
+    long long t_cells = (long long)Gx * Gy * Gz;
+
+    SortItem* items = (SortItem*)malloc((size_t)n * sizeof(SortItem));
+
+    // Assign cells
+    #pragma omp parallel for
+    for (int i = 0; i < n; i++) {
+        int cx = (int)((h_pts[i].x - xmn) / vs); if (cx >= Gx) cx = Gx - 1;
+        int cy = (int)((h_pts[i].y - ymn) / vs); if (cy >= Gy) cy = Gy - 1;
+        int cz = (int)((h_pts[i].z - zmn) / vs); if (cz >= Gz) cz = Gz - 1;
+        items[i].cell = cx * Gy * Gz + cy * Gz + cz;
+        items[i].idx = i;
     }
 
-    int n_padded = 1;
-    while (n_padded < n) n_padded <<= 1;
+    qsort(items, n, sizeof(SortItem), cmp_cells);
 
-    Point* d_pts;
-    uint2* d_morton;
-    int*   d_rank;
-    int*   d_out;
-    CUDA_CHECK(cudaMalloc(&d_pts,    (size_t)n        * sizeof(Point)));
-    CUDA_CHECK(cudaMalloc(&d_morton, (size_t)n_padded * sizeof(uint2)));
-    CUDA_CHECK(cudaMalloc(&d_rank,   (size_t)n        * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_out,    (size_t)n        * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_pts, h_pts, (size_t)n * sizeof(Point),
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_morton, 0xFF, (size_t)n_padded * sizeof(uint2)));
+    // Setup SoA layout for coalesced memory access
+    int* px   = (int*)malloc((size_t)n * sizeof(int));
+    int* py   = (int*)malloc((size_t)n * sizeof(int));
+    int* pz   = (int*)malloc((size_t)n * sizeof(int));
+    int* pI   = (int*)malloc((size_t)n * sizeof(int));
+    int* orig = (int*)malloc((size_t)n * sizeof(int));
 
-    int grid        = (n        + BLOCK_SZ - 1) / BLOCK_SZ;
-    int padded_grid = (n_padded + BLOCK_SZ - 1) / BLOCK_SZ;
+    #pragma omp parallel for
+    for (int i = 0; i < n; i++) {
+        int oi = items[i].idx;
+        px[i]   = h_pts[oi].x;
+        py[i]   = h_pts[oi].y;
+        pz[i]   = h_pts[oi].z;
+        pI[i]   = h_pts[oi].intensity;
+        orig[i] = oi;
+    }
 
-    compute_morton_kernel<<<grid, BLOCK_SZ>>>(
-        d_pts, n, xmin, ymin, zmin,
-        xmax - xmin, ymax - ymin, zmax - zmin, d_morton);
+    // Build prefix sum for cell offsets
+    int* cs = (int*)calloc((size_t)t_cells, sizeof(int));
+    int* cc = (int*)calloc((size_t)t_cells, sizeof(int));
+    
+    for (int i = 0; i < n; i++) cc[items[i].cell]++;
+    for (long long c = 1; c < t_cells; c++) cs[c] = cs[c - 1] + cc[c - 1];
+
+    int *d_px, *d_py, *d_pz, *d_pI, *d_orig, *d_cs, *d_cc, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_px,   (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_py,   (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pz,   (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pI,   (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_orig, (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_cs,   (size_t)t_cells * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_cc,   (size_t)t_cells * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_out,  (size_t)n * sizeof(int)));
+
+    CUDA_CHECK(cudaMemcpy(d_px,   px,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_py,   py,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pz,   pz,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pI,   pI,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_orig, orig, (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cs,   cs,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cc,   cc,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
+
+    int blk = BLOCK_SZ, grd = (n + blk - 1) / blk;
+    approx_knn_kernel<<<grd, blk>>>(
+        d_px, d_py, d_pz, d_pI, d_orig, n,
+        d_cs, d_cc, Gx, Gy, Gz, xmn, ymn, zmn, 1.0f / vs, k, d_out);
+    
     CUDA_CHECK(cudaGetLastError());
-
-    for (int stage = 2; stage <= n_padded; stage <<= 1)
-        for (int step = stage >> 1; step > 0; step >>= 1) {
-            bitonic_sort_step<<<padded_grid, BLOCK_SZ>>>(
-                d_morton, n_padded, step, stage);
-            CUDA_CHECK(cudaGetLastError());
-        }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    build_rank_kernel<<<grid, BLOCK_SZ>>>(d_morton, n, d_rank);
-    CUDA_CHECK(cudaGetLastError());
-
-    int window = std::min(n, std::max(APPROX_WIN_FACTOR * k, k + 1));
-    approx_knn_kernel<<<grid, BLOCK_SZ>>>(
-        d_pts, d_rank, d_morton, n, k, window, d_out);
-    CUDA_CHECK(cudaGetLastError());
-
     int* h_out = (int*)malloc((size_t)n * sizeof(int));
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, (size_t)n * sizeof(int),
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
 
     write_output("approx_knn.txt", h_pts, h_out, n);
-    cudaFree(d_pts); cudaFree(d_morton); cudaFree(d_rank);
-    cudaFree(d_out); free(h_out);
+
+    cudaFree(d_px); cudaFree(d_py); cudaFree(d_pz); cudaFree(d_pI);
+    cudaFree(d_orig); cudaFree(d_cs); cudaFree(d_cc); cudaFree(d_out);
+
+    free(items); free(px); free(py); free(pz);
+    free(pI); free(orig); free(cs); free(cc); free(h_out);
 }
 
 static void run_kmeans(const Point* h_pts, int n, int k, int T) {
-    float4* h_centroids = (float4*)malloc((size_t)k * sizeof(float4));
+    int4* h_centroids = (int4*)malloc((size_t)k * sizeof(int4));
     for (int c = 0; c < k; c++)
-        h_centroids[c] = { (float)h_pts[c].x, (float)h_pts[c].y,
-                           (float)h_pts[c].z,  0.0f };
+        h_centroids[c] = { h_pts[c].x, h_pts[c].y, h_pts[c].z, 0 };
 
-    Point*  d_pts;
-    float4* d_centroids;
-    int*    d_assignments;
-    int*    d_changed;
-    float*  d_accum_cx, *d_accum_cy, *d_accum_cz;
-    int*    d_accum_cnt;
-    int*    d_cluster_hist;
-    int*    d_cluster_size;
-    int*    d_out;
+    Point* d_pts;
+    int4* d_centroids;
+    int* d_assignments;
+    int* d_changed;
+    int* d_accum_cx, *d_accum_cy, *d_accum_cz;
+    int* d_accum_cnt;
+    int* d_cluster_hist;
+    int* d_cluster_size;
+    int* d_out;
 
     CUDA_CHECK(cudaMalloc(&d_pts,          (size_t)n             * sizeof(Point)));
-    CUDA_CHECK(cudaMalloc(&d_centroids,    (size_t)k             * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(&d_centroids,    (size_t)k             * sizeof(int4)));
     CUDA_CHECK(cudaMalloc(&d_assignments,  (size_t)n             * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_changed,                              sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cx,     (size_t)k             * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cy,     (size_t)k             * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cz,     (size_t)k             * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cx,     (size_t)k             * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cy,     (size_t)k             * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cz,     (size_t)k             * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_accum_cnt,    (size_t)k             * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cluster_hist, (size_t)k * HIST_BINS * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cluster_size, (size_t)k             * sizeof(int)));
@@ -731,32 +781,30 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
 
     CUDA_CHECK(cudaMemcpy(d_pts,       h_pts,       (size_t)n * sizeof(Point),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_centroids, h_centroids, (size_t)k * sizeof(float4),
+    CUDA_CHECK(cudaMemcpy(d_centroids, h_centroids, (size_t)k * sizeof(int4),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_assignments, 0, (size_t)n * sizeof(int)));
 
-    // [K40m] cudaFuncCachePreferShared gives 48 KB shared to the assign kernel.
-    //        At k=128, smem_size = 8 warps * 128 * 16 bytes = 16 KB, which
-    //        exactly hits the Kepler default 16 KB limit. Flipping to prefer-
-    //        shared makes 48 KB available, preventing overflow at max k.
     CUDA_CHECK(cudaFuncSetCacheConfig(
         kmeans_assign_and_accumulate_kernel, cudaFuncCachePreferShared));
 
     int grid      = (n + BLOCK_SZ - 1) / BLOCK_SZ;
     int k_grid    = (k + BLOCK_SZ - 1) / BLOCK_SZ;
     int num_warps = BLOCK_SZ / 32;
-    int smem_size = num_warps * (3 * k * (int)sizeof(float) + k * (int)sizeof(int));
+    // 4 integer arrays (x, y, z, cnt) per warp
+    int smem_size = num_warps * 4 * k * (int)sizeof(int); 
     int h_changed = 0;
 
     for (int iter = 0; iter < T; iter++) {
         CUDA_CHECK(cudaMemsetAsync(d_changed,   0, sizeof(int)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cx,  0, (size_t)k * sizeof(float)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cy,  0, (size_t)k * sizeof(float)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cz,  0, (size_t)k * sizeof(float)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cx,  0, (size_t)k * sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cy,  0, (size_t)k * sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cz,  0, (size_t)k * sizeof(int)));
         CUDA_CHECK(cudaMemsetAsync(d_accum_cnt, 0, (size_t)k * sizeof(int)));
 
-        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_const_centroids, d_centroids,
-                                           (size_t)k * sizeof(float4), 0,
+        // Assuming you updated the constant memory array name to dc_cent
+        CUDA_CHECK(cudaMemcpyToSymbolAsync(dc_cent, d_centroids,
+                                           (size_t)k * sizeof(int4), 0,
                                            cudaMemcpyDeviceToDevice));
 
         kmeans_assign_and_accumulate_kernel<<<grid, BLOCK_SZ, smem_size>>>(
@@ -1024,48 +1072,84 @@ static void seq_approx_knn(const Point* pts, int n, int k, std::vector<int>& out
         out[i] = equalize_approx_host(pts, heap.data(), heap_sz, q.intensity);
     }
 }
-
 static void seq_kmeans(const Point* pts, int n, int k, int T, std::vector<int>& out) {
     out.resize(n);
-    std::vector<float> cx(k), cy(k), cz(k);
-    for (int c = 0; c < k; c++) { cx[c]=(float)pts[c].x; cy[c]=(float)pts[c].y; cz[c]=(float)pts[c].z; }
+    
+    // Centroids are strictly integers
+    std::vector<int> cx(k), cy(k), cz(k);
+    for (int c = 0; c < k; c++) { 
+        cx[c] = pts[c].x; cy[c] = pts[c].y; cz[c] = pts[c].z; 
+    }
+    
     std::vector<int> asgn(n, 0);
     for (int iter = 0; iter < T; iter++) {
         bool changed = false;
+        
         for (int i = 0; i < n; i++) {
-            float px=(float)pts[i].x, py=(float)pts[i].y, pz=(float)pts[i].z;
-            int best_c=0; float best_d=FLT_MAX;
+            int px = pts[i].x, py = pts[i].y, pz = pts[i].z;
+            int best_c = 0; 
+            long long best_d = 9223372036854775807LL; // LLONG_MAX
+            
             for (int c = 0; c < k; c++) {
-                float dx=px-cx[c],dy=py-cy[c],dz=pz-cz[c];
-                float d2=dx*dx+dy*dy+dz*dz;
-                if (d2 < best_d) { best_d=d2; best_c=c; }
+                long long dx = px - cx[c], dy = py - cy[c], dz = pz - cz[c];
+                long long d2 = dx*dx + dy*dy + dz*dz;
+                
+                // Strict deterministic tie-breaker
+                bool rep = false;
+                if (d2 < best_d) rep = true;
+                else if (d2 == best_d) {
+                    if (cx[c] < cx[best_c]) rep = true;
+                    else if (cx[c] == cx[best_c]) {
+                        if (cy[c] < cy[best_c]) rep = true;
+                        else if (cy[c] == cy[best_c] && cz[c] < cz[best_c]) rep = true;
+                    }
+                }
+                
+                if (rep) { best_d = d2; best_c = c; }
             }
-            if (asgn[i] != best_c) { asgn[i]=best_c; changed=true; }
+            if (asgn[i] != best_c) { asgn[i] = best_c; changed = true; }
         }
+        
         if (!changed && iter > 0) break;
-        std::vector<float> ncx(k,0), ncy(k,0), ncz(k,0);
+        
+        // Accumulate using long long to avoid overflow on large clusters
+        std::vector<long long> ncx(k,0), ncy(k,0), ncz(k,0);
         std::vector<int> cnt(k, 0);
         for (int i = 0; i < n; i++) {
-            int c=asgn[i]; ncx[c]+=(float)pts[i].x; ncy[c]+=(float)pts[i].y; ncz[c]+=(float)pts[i].z; cnt[c]++;
+            int c = asgn[i]; 
+            ncx[c] += pts[i].x; ncy[c] += pts[i].y; ncz[c] += pts[i].z; 
+            cnt[c]++;
         }
-        for (int c = 0; c < k; c++) if (cnt[c]>0) { cx[c]=ncx[c]/cnt[c]; cy[c]=ncy[c]/cnt[c]; cz[c]=ncz[c]/cnt[c]; }
+        
+        for (int c = 0; c < k; c++) {
+            if (cnt[c] > 0) { 
+                // Integer division enforces truncation, preventing cluster drift
+                cx[c] = (int)(ncx[c] / cnt[c]); 
+                cy[c] = (int)(ncy[c] / cnt[c]); 
+                cz[c] = (int)(ncz[c] / cnt[c]); 
+            }
+        }
     }
-    std::vector<int> hist((size_t)k*HIST_BINS, 0);
-    for (int i = 0; i < n; i++) hist[(size_t)asgn[i]*HIST_BINS+pts[i].intensity]++;
-    std::vector<int> cdf((size_t)k*HIST_BINS,0), cdf_min(k,0), cluster_sz(k,0);
+    
+    std::vector<int> hist((size_t)k * HIST_BINS, 0);
+    for (int i = 0; i < n; i++) hist[(size_t)asgn[i] * HIST_BINS + pts[i].intensity]++;
+    
+    std::vector<int> cdf((size_t)k * HIST_BINS, 0), cdf_min(k, 0), cluster_sz(k, 0);
     for (int c = 0; c < k; c++) {
-        int sum=0, first_nz=0;
+        int sum = 0, first_nz = 0;
         for (int v = 0; v < HIST_BINS; v++) {
-            sum+=hist[(size_t)c*HIST_BINS+v]; cdf[(size_t)c*HIST_BINS+v]=sum;
-            if (first_nz==0&&sum>0) first_nz=sum;
+            sum += hist[(size_t)c * HIST_BINS + v]; 
+            cdf[(size_t)c * HIST_BINS + v] = sum;
+            if (first_nz == 0 && sum > 0) first_nz = sum;
         }
-        cdf_min[c]=first_nz; cluster_sz[c]=sum;
+        cdf_min[c] = first_nz; cluster_sz[c] = sum;
     }
+    
     for (int i = 0; i < n; i++) {
-        int c=asgn[i], Ii=pts[i].intensity;
-        int cs=cdf[(size_t)c*HIST_BINS+Ii], cm=cdf_min[c], m=cluster_sz[c];
+        int c = asgn[i], Ii = pts[i].intensity;
+        int cs = cdf[(size_t)c * HIST_BINS + Ii], cm = cdf_min[c], m = cluster_sz[c];
 
-        if (m == cm) {
+        if (m == cm || m == 0) {
             out[i] = Ii;
         } else {
             int val = (int)(((long long)(cs - cm) * 255) / (m - cm));

@@ -369,29 +369,29 @@ __global__ void approx_knn_kernel(const Point* __restrict__ pts,
 
 
 
-__constant__ float4 d_const_centroids[MAX_K];  
+__constant__ int4 d_const_centroids[MAX_K];  
 
 __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ pts,
                                       int n, int k,
                                       int* __restrict__ assignments,
                                       int* __restrict__ d_changed,
-                                      float* __restrict__ accum_cx,
-                                      float* __restrict__ accum_cy,
-                                      float* __restrict__ accum_cz,
+                                      unsigned long long* __restrict__ accum_cx,
+                                      unsigned long long* __restrict__ accum_cy,
+                                      unsigned long long* __restrict__ accum_cz,
                                       int*   __restrict__ accum_cnt) 
 {
-    extern __shared__ float smem[];
+    extern __shared__ unsigned long long smem_ull[];
     const int num_warps = blockDim.x / 32;
     const int warp_id   = threadIdx.x / 32;
 
-    float* sx = smem;
-    float* sy = smem + num_warps * k;
-    float* sz = smem + 2 * num_warps * k;
-    int*   sc = (int*)(smem + 3 * num_warps * k);
+    unsigned long long* sx = smem_ull;
+    unsigned long long* sy = smem_ull + num_warps * k;
+    unsigned long long* sz = smem_ull + 2 * num_warps * k;
+    int*   sc = (int*)(smem_ull + 3 * num_warps * k);
 
     int total_elements = num_warps * k;
     for (int t = threadIdx.x; t < total_elements; t += blockDim.x) {
-        sx[t] = sy[t] = sz[t] = 0.0f;
+        sx[t] = sy[t] = sz[t] = 0;
         sc[t] = 0;
     }
     __syncthreads();
@@ -399,16 +399,16 @@ __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ p
     int i = blockIdx.x * BLOCK_SZ + threadIdx.x;
     if (i < n) {
         Point p = pts[i];
-        float px = (float)p.x, py = (float)p.y, pz = (float)p.z;
+        long long px = p.x, py = p.y, pz = p.z;
         int   best_c = -1;
-        float best_d = FLT_MAX;
+        long long best_d = LLONG_MAX;
 
         for (int c = 0; c < k; c++) {
-            float4 cent = d_const_centroids[c];   // broadcast from constant cache
-            float dx = px - cent.x;
-            float dy = py - cent.y;
-            float dz = pz - cent.z;
-            float d2 = dx*dx + dy*dy + dz*dz;
+            int4 cent = d_const_centroids[c];   // broadcast from constant cache
+            long long dx = px - cent.x;
+            long long dy = py - cent.y;
+            long long dz = pz - cent.z;
+            long long d2 = dx*dx + dy*dy + dz*dz;
             if (d2 < best_d) { best_d = d2; best_c = c; }
         }
 
@@ -419,15 +419,15 @@ __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ p
         }
 
         int idx = warp_id * k + best_c;
-        atomicAdd(&sx[idx], px);
-        atomicAdd(&sy[idx], py);
-        atomicAdd(&sz[idx], pz);
+        atomicAdd(&sx[idx], (unsigned long long)px);
+        atomicAdd(&sy[idx], (unsigned long long)py);
+        atomicAdd(&sz[idx], (unsigned long long)pz);
         atomicAdd(&sc[idx], 1);
     }
     __syncthreads();
 
     for (int c = threadIdx.x; c < k; c += blockDim.x) {
-        float sum_x = 0, sum_y = 0, sum_z = 0;
+        unsigned long long sum_x = 0, sum_y = 0, sum_z = 0;
         int sum_c = 0;
         for (int w = 0; w < num_warps; w++) {
             int idx = w * k + c;
@@ -447,19 +447,19 @@ __global__ void kmeans_assign_and_accumulate_kernel(const Point*  __restrict__ p
 }
 
 // New centroid = mean of its members.  Empty clusters keep their prior centroid.
-__global__ void kmeans_finalize_kernel(float4*      __restrict__ centroids,
-                                        const float* __restrict__ accum_cx,
-                                        const float* __restrict__ accum_cy,
-                                        const float* __restrict__ accum_cz,
+__global__ void kmeans_finalize_kernel(int4*      __restrict__ centroids,
+                                        const unsigned long long* __restrict__ accum_cx,
+                                        const unsigned long long* __restrict__ accum_cy,
+                                        const unsigned long long* __restrict__ accum_cz,
                                         const int*   __restrict__ accum_cnt,
                                         int k) 
 {
     int c = blockIdx.x * BLOCK_SZ + threadIdx.x;
     if (c >= k) return;
     if (accum_cnt[c] > 0)
-        centroids[c] = { accum_cx[c] / accum_cnt[c],
-                         accum_cy[c] / accum_cnt[c],
-                         accum_cz[c] / accum_cnt[c], 0.0f };
+        centroids[c] = { (int)(accum_cx[c] / accum_cnt[c]),
+                         (int)(accum_cy[c] / accum_cnt[c]),
+                         (int)(accum_cz[c] / accum_cnt[c]), 0 };
 }
 
 // Build per-cluster intensity histogram.
@@ -523,8 +523,8 @@ __global__ void equalize_kmeans_kernel(const Point* __restrict__ pts,
     if (m == cm) {
         out_intensity[i] = Ii;
     } else {
-        float val = (float)(cdf_self - cm) / (float)(m - cm) * 255.0f;
-        out_intensity[i] = (int)roundf(val);
+        int val = (int)(((long long)(cdf_self - cm) * 255) / (m - cm));
+        out_intensity[i] = max(0, min(255, val));
     }
 }
 
@@ -785,11 +785,11 @@ static void seq_approx_knn(const Point* pts, int n, int k, std::vector<int>& out
 static void seq_kmeans(const Point* pts, int n, int k, int T, std::vector<int>& out) {
     out.resize(n);
 
-    std::vector<float> cx(k), cy(k), cz(k);
+    std::vector<int> cx(k), cy(k), cz(k);
     for (int c = 0; c < k; c++) {
-        cx[c] = (float)pts[c].x;
-        cy[c] = (float)pts[c].y;
-        cz[c] = (float)pts[c].z;
+        cx[c] = pts[c].x;
+        cy[c] = pts[c].y;
+        cz[c] = pts[c].z;
     }
 
     std::vector<int> asgn(n, 0);
@@ -798,12 +798,12 @@ static void seq_kmeans(const Point* pts, int n, int k, int T, std::vector<int>& 
         bool changed = false;
 
         for (int i = 0; i < n; i++) {
-            float px = (float)pts[i].x, py = (float)pts[i].y, pz = (float)pts[i].z;
+            int px = pts[i].x, py = pts[i].y, pz = pts[i].z;
             int best_c = 0;
-            float best_d = FLT_MAX;
+            long long best_d = LLONG_MAX;
             for (int c = 0; c < k; c++) {
-                float dx = px - cx[c], dy = py - cy[c], dz = pz - cz[c];
-                float d2 = dx * dx + dy * dy + dz * dz;
+                long long dx = px - cx[c], dy = py - cy[c], dz = pz - cz[c];
+                long long d2 = dx * dx + dy * dy + dz * dz;
                 if (d2 < best_d) {
                     best_d = d2;
                     best_c = c;
@@ -817,13 +817,13 @@ static void seq_kmeans(const Point* pts, int n, int k, int T, std::vector<int>& 
 
         if (!changed && iter > 0) break;
 
-        std::vector<float> ncx(k, 0.f), ncy(k, 0.f), ncz(k, 0.f);
+        std::vector<long long> ncx(k, 0), ncy(k, 0), ncz(k, 0);
         std::vector<int> cnt(k, 0);
         for (int i = 0; i < n; i++) {
             int c = asgn[i];
-            ncx[c] += (float)pts[i].x;
-            ncy[c] += (float)pts[i].y;
-            ncz[c] += (float)pts[i].z;
+            ncx[c] += pts[i].x;
+            ncy[c] += pts[i].y;
+            ncz[c] += pts[i].z;
             cnt[c]++;
         }
         for (int c = 0; c < k; c++) {
@@ -1210,28 +1210,28 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
 
 static void run_kmeans(const Point* h_pts, int n, int k, int T) {
     // Centroids initialized from the first k points.
-    float4* h_centroids = (float4*)malloc((size_t)k * sizeof(float4));
+    int4* h_centroids = (int4*)malloc((size_t)k * sizeof(int4));
     for (int c = 0; c < k; c++)
-        h_centroids[c] = { (float)h_pts[c].x, (float)h_pts[c].y,
-                           (float)h_pts[c].z,  0.0f };
+        h_centroids[c] = { h_pts[c].x, h_pts[c].y,
+                           h_pts[c].z, 0 };
 
     Point*  d_pts;
-    float4* d_centroids;
+    int4* d_centroids;
     int*    d_assignments;
     int*    d_changed;
-    float*  d_accum_cx, *d_accum_cy, *d_accum_cz;
+    unsigned long long*  d_accum_cx, *d_accum_cy, *d_accum_cz;
     int*    d_accum_cnt;
     int*    d_cluster_hist;
     int*    d_cluster_size;
     int*    d_out;
 
     CUDA_CHECK(cudaMalloc(&d_pts,          (size_t)n             * sizeof(Point)));
-    CUDA_CHECK(cudaMalloc(&d_centroids,    (size_t)k             * sizeof(float4)));
+    CUDA_CHECK(cudaMalloc(&d_centroids,    (size_t)k             * sizeof(int4)));
     CUDA_CHECK(cudaMalloc(&d_assignments,  (size_t)n             * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_changed,                              sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cx,     (size_t)k             * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cy,     (size_t)k             * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_accum_cz,     (size_t)k             * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cx,     (size_t)k             * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cy,     (size_t)k             * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&d_accum_cz,     (size_t)k             * sizeof(unsigned long long)));
     CUDA_CHECK(cudaMalloc(&d_accum_cnt,    (size_t)k             * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cluster_hist, (size_t)k * HIST_BINS * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cluster_size, (size_t)k             * sizeof(int)));
@@ -1239,26 +1239,26 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
 
     CUDA_CHECK(cudaMemcpy(d_pts,       h_pts,       (size_t)n * sizeof(Point),
                           cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_centroids, h_centroids, (size_t)k * sizeof(float4),
+    CUDA_CHECK(cudaMemcpy(d_centroids, h_centroids, (size_t)k * sizeof(int4),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_assignments, 0, (size_t)n * sizeof(int)));
 
     int grid     = (n + BLOCK_SZ - 1) / BLOCK_SZ;
     int k_grid   = (k + BLOCK_SZ - 1) / BLOCK_SZ;
     int num_warps = BLOCK_SZ / 32;
-    int smem_size = num_warps * (3 * k * (int)sizeof(float) + k * (int)sizeof(int));
+    int smem_size = num_warps * (3 * k * (int)sizeof(unsigned long long) + k * (int)sizeof(int));
     int h_changed = 0;
 
     for (int iter = 0; iter < T; iter++) {
         // Use Async memsets on stream 0 to overlap launch overhead
         CUDA_CHECK(cudaMemsetAsync(d_changed, 0, sizeof(int)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cx,  0, (size_t)k * sizeof(float)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cy,  0, (size_t)k * sizeof(float)));
-        CUDA_CHECK(cudaMemsetAsync(d_accum_cz,  0, (size_t)k * sizeof(float)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cx,  0, (size_t)k * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cy,  0, (size_t)k * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemsetAsync(d_accum_cz,  0, (size_t)k * sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemsetAsync(d_accum_cnt, 0, (size_t)k * sizeof(int)));
         
         // Copy updated centroids to constant memory for the assign kernel
-        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_const_centroids, d_centroids, (size_t)k * sizeof(float4), 0, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpyToSymbolAsync(d_const_centroids, d_centroids, (size_t)k * sizeof(int4), 0, cudaMemcpyDeviceToDevice));
 
         kmeans_assign_and_accumulate_kernel<<<grid, BLOCK_SZ, smem_size>>>(
             d_pts, n, k, d_assignments, d_changed, d_accum_cx, d_accum_cy, d_accum_cz, d_accum_cnt);
