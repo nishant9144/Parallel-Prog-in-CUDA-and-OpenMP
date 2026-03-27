@@ -185,71 +185,92 @@ int equalize(const Point* pts, const int* neighbors,
 
 \subsection{Overview}
 
-The approximate KNN approach trades exactness for speed by using a \textbf{3D spatial grid (voxel hashing)} to restrict the neighbor search to nearby cells. Instead of searching the entire point cloud, each point only examines points within a small radius of grid cells around its own cell.
+The approximate KNN approach trades exactness for speed by using a \textbf{3D spatial grid (voxel hashing)} to restrict the neighbor search to nearby cells. A key design choice is the use of a \textbf{precomputed, distance-sorted cell-offset table} stored in constant memory, which replaces the traditional nested-loop expanding-shell pattern with a flat iteration and enables fine-grained cell-level distance pruning.
 
 \subsection{Algorithm}
 
 \begin{enumerate}
-    \item \textbf{Bounding box}: Compute the axis-aligned bounding box of all points using an OpenMP parallel reduction.
-    \item \textbf{Grid construction}: Divide the 3D space into a uniform voxel grid. The voxel size is chosen adaptively:
+    \item \textbf{Bounding box}: Compute the axis-aligned bounding box via OpenMP parallel reduction.
+    \item \textbf{Grid construction}: Divide 3D space into a uniform voxel grid with adaptive cell size:
     \[
         v_s = \frac{\max(l_x, l_y, l_z)}{\sqrt[3]{27n / (k+1)}}
     \]
-    This heuristic targets approximately $k+1$ points per cell on average, ensuring each cell has enough neighbors for the KNN query while keeping each cell small enough for locality.
-    \item \textbf{Sorting}: Points are assigned to cells and sorted by cell ID using \texttt{qsort}. A prefix-sum array records the start offset and count of points in each cell.
-    \item \textbf{GPU kernel}: Each thread searches cells in expanding concentric shells (radius 0 to 4) around its own cell. Points in previously searched (inner) shells are skipped to avoid redundant computation.
+    This targets roughly $k{+}1$ points in a $3 \times 3 \times 3$ neighborhood.
+    \item \textbf{Counting sort}: Points are assigned to cells (OpenMP parallel) and reordered by cell ID using an $O(n)$ counting sort. Prefix sums record each cell's start offset and count.
+    \item \textbf{Offset table}: All $(2R{+}1)^3 = 729$ cell offsets (for $R{=}4$) are precomputed, annotated with a \emph{lower-bound distance key}, sorted, and uploaded to \texttt{\_\_constant\_\_} memory.
+    \item \textbf{GPU kernel}: Each thread iterates over the sorted offset table, visits the corresponding cell, and maintains a $k$-best candidate list. The iteration terminates early when the lower-bound key guarantees no closer neighbor exists.
 \end{enumerate}
 
 \subsection{Implementation Details}
 
-\subsubsection{Host-Side Preprocessing}
+\subsubsection{Counting Sort (Host)}
 
-\begin{itemize}
-    \item \textbf{OpenMP parallel bounding box}: The min/max over all coordinates is computed using \texttt{\#pragma omp parallel for reduction(min:...) reduction(max:...)}.
-    \item \textbf{Cell assignment}: Each point is mapped to a cell index $(\text{cx}, \text{cy}, \text{cz})$ and linearized as $\text{cx} \times G_y \times G_z + \text{cy} \times G_z + \text{cz}$. This is parallelized with OpenMP.
-    \item \textbf{Sorting by cell}: Points are reordered so that all points in the same cell are contiguous in memory. This ensures that when the GPU kernel iterates over a cell's points, the accesses are sequential and coalesced.
-\end{itemize}
+The original approach used \texttt{qsort} ($O(n \log n)$) to reorder points by cell ID. Since cell IDs are bounded integers in $[0, G_x G_y G_z)$, a \textbf{counting sort} achieves $O(n + C)$ time where $C$ is the number of cells:
+\begin{enumerate}
+    \item Histogram cell occupancies in a single pass.
+    \item Exclusive prefix sum to obtain write offsets.
+    \item Scatter points into sorted order using per-cell write cursors.
+\end{enumerate}
+This eliminates the comparison-based sorting bottleneck entirely.
 
-\subsubsection{GPU Kernel}
+\subsubsection{Precomputed Offset Table}
 
-The kernel maintains a simple linear $k$-best list (arrays \texttt{kd[128]} for distances and \texttt{ki[128]} for indices). When the list is full, a new point replaces the current worst if it is closer. The worst is tracked by a linear scan over the $k$ entries.
+For radius $R = 4$, the $9^3 = 729$ cell offsets $(\Delta x, \Delta y, \Delta z)$ are precomputed on the host. Each offset is annotated with a \textbf{lower-bound key}:
+\[
+    \text{lb}(\Delta x, \Delta y, \Delta z) = \bigl(\!\max(0, |\Delta x|{-}1)\bigr)^2 + \bigl(\!\max(0, |\Delta y|{-}1)\bigr)^2 + \bigl(\!\max(0, |\Delta z|{-}1)\bigr)^2
+\]
+This key, when multiplied by $v_s^2$, gives a valid \emph{lower bound} on the squared Euclidean distance from the query point to any point in the target cell. The offsets are sorted by this key, with ties broken by L1 norm, and uploaded to constant memory:
 
-\begin{lstlisting}[caption={Expanding shell search in approximate KNN}]
-for (int r = 0; r <= 4; r++) {
-    // Iterate over cells in shell of radius r
-    for (int gx = ax; gx <= bx; gx++)
-    for (int gy = ay; gy <= by; gy++)
-    for (int gz = az; gz <= bz; gz++) {
-        // Skip inner cells already visited
-        if (r > 0 && abs(gx-cx)<r && abs(gy-cy)<r
-                   && abs(gz-cz)<r) continue;
-        // Search all points in this cell
-        ...
-    }
-    if (r >= 2 && cnt == k) break; // Early exit
+\begin{lstlisting}[caption={Offset table structure and initialization}]
+struct CellOff { short dx, dy, dz, lb; };
+__constant__ CellOff g_cell_offs[729];
+
+// Host: sort by lower-bound key
+std::sort(tbl, tbl + cnt,
+    [](const CellOff& a, const CellOff& b) {
+        if (a.lb != b.lb) return a.lb < b.lb;
+        return (abs(a.dx)+abs(a.dy)+abs(a.dz))
+             < (abs(b.dx)+abs(b.dy)+abs(b.dz));
+    });
+\end{lstlisting}
+
+\subsubsection{GPU Kernel with Cell-Level Pruning}
+
+The kernel iterates over the sorted offset table in a single flat loop instead of nested shell loops. The key optimization is \textbf{cell-level distance pruning}:
+
+\begin{lstlisting}[caption={Cell-level pruning via lower-bound key}]
+for (int oidx = 0; oidx < noffs; oidx++) {
+    CellOff off = g_cell_offs[oidx];
+
+    // If lb * vs^2 >= worst distance, no cell
+    // from here onward can improve the k-best set
+    if (cnt == k && (double)off.lb * vs2 >= (double)wD)
+        break;
+
+    int gx = cx + off.dx, gy = cy + off.dy, ...
+    // unsigned compare folds < 0 and >= G checks
+    if ((unsigned)gx >= (unsigned)Gx || ...) continue;
+    // ... search points in cell (gx, gy, gz)
 }
 \end{lstlisting}
 
-\textbf{Early termination}: If $k$ neighbors have been found by radius $\geq 2$, the search stops. This is the key to the speedup --- most points find their neighbors within a small radius.
+Since offsets are sorted by lower-bound distance, \emph{all subsequent offsets} have equal or larger lower bounds. Once the pruning condition triggers, the loop terminates. This provides finer-grained early exit than the original radius-level check (\texttt{if r >= 2 \&\& cnt == k}).
 
-\subsubsection{Inline Equalization}
-
-Similar to the exact KNN kernel, histogram computation, CDF, and intensity remapping are performed inline within the same kernel to avoid extra global memory traffic.
+Additional kernel-level optimizations:
+\begin{itemize}
+    \item \textbf{\texttt{\_\_ldg()} intrinsic}: Used for all read-only integer loads (cell offsets, counts, original indices) to route reads through the texture cache path, improving throughput for scattered access patterns.
+    \item \textbf{\texttt{uint8\_t} histogram}: The local histogram uses \texttt{uint8\_t} instead of \texttt{int}, reducing per-thread local memory from 1024\,B to 256\,B. Since $k \leq 128$, bin counts always fit in a byte.
+    \item \textbf{Fused histogram/CDF}: Histogram accumulation, CDF prefix sum, and intensity remapping are performed in a single pass per query point, eliminating the need for a separate 256-element \texttt{cdf[]} array.
+    \item \textbf{Unsigned boundary checks}: The condition \texttt{(unsigned)gx >= (unsigned)Gx} folds both the $< 0$ and $\geq G$ comparisons into a single branch, reducing instruction count.
+\end{itemize}
 
 \subsection{Trade-offs: Accuracy vs.\ Speed}
 
 \begin{itemize}
-    \item \textbf{Accuracy}: The grid-based approach is approximate because the search may miss true $k$-nearest neighbors that lie in cells beyond the maximum search radius. The quality depends on:
-    \begin{itemize}
-        \item The voxel size (too large $\Rightarrow$ too many candidates; too small $\Rightarrow$ may miss neighbors).
-        \item The maximum radius (capped at 4 shells).
-        \item The spatial distribution of points (uniform distributions favor this approach).
-    \end{itemize}
-    \item \textbf{Speed}: By restricting the search space to a small number of cells, the per-point work is reduced from $O(n)$ (brute-force) or $O(\log n)$ (KD-tree) to $O(c)$ where $c$ is the number of points in nearby cells. For well-distributed data, $c \approx O(k)$.
-    \item \textbf{Grid sizing heuristic}: The cube-root formula $\sqrt[3]{27n/(k+1)}$ ensures that each cell contains on the order of $(k+1)/27$ points, so a $3 \times 3 \times 3$ neighborhood (radius 1) typically contains enough neighbors. The factor of 27 accounts for the 27 cells in a radius-1 cube.
+    \item \textbf{Accuracy}: The search may miss true neighbors beyond the maximum offset radius ($R = 4$). Accuracy depends on the voxel size, point distribution, and $k$. The adaptive $v_s$ formula ensures that a radius-1 shell typically captures $\sim k$ points; the extended radius provides a margin for non-uniform distributions.
+    \item \textbf{Speed}: Per-point work is $O(c)$ where $c$ is the number of candidate points in visited cells. The cell-level pruning ensures that $c$ is minimized by visiting only cells whose lower-bound distance is competitive with the current $k$-best set. The counting sort reduces host preprocessing from $O(n \log n)$ to $O(n)$.
+    \item \textbf{Constant memory efficiency}: The 729-entry offset table consumes $729 \times 8 = 5{,}832$ bytes of constant memory. Since all threads read the same offsets in lockstep, the constant cache broadcasts each entry to the full warp at zero extra cost.
 \end{itemize}
-
-The algorithm is specifically chosen for its parallelizability --- each point's search is entirely independent, with no synchronization or shared mutable state between threads, making it ideal for GPU execution.
 
 % ═══════════════════════════════════════════════════════════════════════
 \section{Approach 3: K-Means Clustering}

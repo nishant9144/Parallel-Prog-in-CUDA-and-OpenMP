@@ -105,84 +105,116 @@ int equalize(const Point* pts, const int* neighbors, int k, int self_I) {
 }
 
 
+// ─── Pre-sorted cell offsets for grid-based neighbor search ──────────
+#define SEARCH_R    4
+#define N_OFFSETS   729                    /* (2*SEARCH_R+1)^3 */
 
+struct CellOff { short dx, dy, dz, lb; }; /* lb = lower-bound key    */
 
+__constant__ CellOff  g_cell_offs[N_OFFSETS];
+__constant__ int      g_n_offs;
 
-
-__global__ void approx_knn(
+__global__ void approx_knn_kernel(
     const Point* __restrict__ pts,
-    const int* __restrict__ orig, int n,
-    const int* __restrict__ c_start, const int* __restrict__ c_cnt,
-    Point grid_dim, Point min_pt, float inv_vs,
-    int k, int* __restrict__ out_I)
+    const int*   __restrict__ orig,   int n,
+    const int*   __restrict__ c_start,
+    const int*   __restrict__ c_cnt,
+    int Gx, int Gy, int Gz,
+    int mn_x, int mn_y, int mn_z,
+    float inv_vs, int k,
+    int* __restrict__ out_I)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    int xi = pts[i].x, yi = pts[i].y, zi = pts[i].z;
-    int cx = min(grid_dim.x - 1, max(0, (int)((xi - min_pt.x) * inv_vs)));
-    int cy = min(grid_dim.y - 1, max(0, (int)((yi - min_pt.y) * inv_vs)));
-    int cz = min(grid_dim.z - 1, max(0, (int)((zi - min_pt.z) * inv_vs)));
+    Point q = pts[i];
+    int oi  = __ldg(&orig[i]);
 
-    // Integer heap
+    int cx = min(Gx - 1, max(0, (int)((q.x - mn_x) * inv_vs)));
+    int cy = min(Gy - 1, max(0, (int)((q.y - mn_y) * inv_vs)));
+    int cz = min(Gz - 1, max(0, (int)((q.z - mn_z) * inv_vs)));
+
+    double vs_recip = 1.0 / (double)inv_vs;
+    double vs2      = vs_recip * vs_recip;
+
+    /* ── k-best candidate list ──────────────────────────────── */
     long long kd[128];
-    int ki[128];
+    int       ki[128];
     int cnt = 0;
-    long long wD = 0; int wP = 0;
+    long long wD = 0;
+    int       wP = 0;
 
-    for (int r = 0; r <= 4; r++) {
-        int ax = max(0, cx - r), bx = min(grid_dim.x - 1, cx + r);
-        int ay = max(0, cy - r), by = min(grid_dim.y - 1, cy + r);
-        int az = max(0, cz - r), bz = min(grid_dim.z - 1, cz + r);
+    int noffs = g_n_offs;
+    for (int oidx = 0; oidx < noffs; oidx++) {
+        CellOff off = g_cell_offs[oidx];
 
-        for (int gx = ax; gx <= bx; gx++)
-        for (int gy = ay; gy <= by; gy++)
-        for (int gz = az; gz <= bz; gz++) {
-            // Skip inner cells already checked in smaller radius
-            if (r > 0 && abs(gx - cx) < r && abs(gy - cy) < r && abs(gz - cz) < r) continue;
+        /* cell-level distance pruning ─────────────────────────
+         * off.lb is sum-of-squares of max(0, |offset|-1) per axis.
+         * Multiplied by vs^2, it lower-bounds the squared Euclidean
+         * distance from q to ANY point in the target cell.
+         * Since offsets are sorted by lb, all later cells are at
+         * least as far away, so we can safely break.             */
+        if (cnt == k && (double)off.lb * vs2 >= (double)wD)
+            break;
 
-            int cid = gx * grid_dim.y * grid_dim.z + gy * grid_dim.z + gz;
-            int start = c_start[cid], c_count = c_cnt[cid];
+        int gx = cx + off.dx;
+        int gy = cy + off.dy;
+        int gz = cz + off.dz;
 
-            for (int t = start; t < start + c_count; t++) {
-                if (orig[t] == orig[i]) continue;
-                
-                long long dx = (long long)(pts[t].x - xi);
-                long long dy = (long long)(pts[t].y - yi);
-                long long dz = (long long)(pts[t].z - zi);
-                long long d = dx*dx + dy*dy + dz*dz;
+        /* unsigned compare folds both < 0 and >= G checks       */
+        if ((unsigned)gx >= (unsigned)Gx ||
+            (unsigned)gy >= (unsigned)Gy ||
+            (unsigned)gz >= (unsigned)Gz)
+            continue;
 
-                if (cnt < k) {
-                    kd[cnt] = d; ki[cnt] = t; ++cnt;
-                    if (cnt == k) {
-                        wD = kd[0]; wP = 0;
-                        for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
-                    }
-                } else if (d < wD) {
-                    kd[wP] = d; ki[wP] = t;
+        int cid   = gx * Gy * Gz + gy * Gz + gz;
+        int start = __ldg(&c_start[cid]);
+        int count = __ldg(&c_cnt[cid]);
+
+        for (int t = start; t < start + count; t++) {
+            if (__ldg(&orig[t]) == oi) continue;
+
+            Point p = pts[t];
+            long long dx = (long long)(p.x - q.x);
+            long long dy = (long long)(p.y - q.y);
+            long long dz = (long long)(p.z - q.z);
+            long long d2 = dx*dx + dy*dy + dz*dz;
+
+            if (cnt < k) {
+                kd[cnt] = d2; ki[cnt] = t; cnt++;
+                if (cnt == k) {
                     wD = kd[0]; wP = 0;
-                    for (int u = 1; u < k; u++) if (kd[u] > wD) { wD = kd[u]; wP = u; }
+                    for (int u = 1; u < k; u++)
+                        if (kd[u] > wD) { wD = kd[u]; wP = u; }
                 }
+            } else if (d2 < wD) {
+                kd[wP] = d2; ki[wP] = t;
+                wD = kd[0]; wP = 0;
+                for (int u = 1; u < k; u++)
+                    if (kd[u] > wD) { wD = kd[u]; wP = u; }
             }
         }
-        if (r >= 2 && cnt == k) break;
     }
 
-    int hist[256] = {0};
-    hist[pts[i].I]++;
-    for (int t = 0; t < cnt; t++) hist[pts[ki[t]].I]++;
+    /* ── fused histogram + CDF + equalization ─────────────────
+     * uint8_t saves 768 B of per-thread local memory (k <= 128) */
+    uint8_t hist[HIST_BINS];
+    memset(hist, 0, HIST_BINS);
+    hist[q.I]++;
+    for (int t = 0; t < cnt; t++)
+        hist[pts[ki[t]].I]++;
 
-    int cdf[256]; cdf[0] = hist[0];
-    for (int v = 1; v < 256; v++) cdf[v] = cdf[v - 1] + hist[v];
+    int m = cnt + 1;
+    int cumsum = 0, cdf_min = 0, cdf_self = 0;
+    for (int v = 0; v < HIST_BINS; v++) {
+        cumsum += hist[v];
+        if (cdf_min == 0 && cumsum > 0) cdf_min = cumsum;
+        if (v == q.I) cdf_self = cumsum;
+    }
 
-    int cdf_min = 0;
-    for (int v = 0; v < 256; v++) if (cdf[v] > 0) { cdf_min = cdf[v]; break; }
-
-    int Ii = pts[i].I, m = cnt + 1;
-    if (m == cdf_min || m == 0) { out_I[orig[i]] = Ii; return; }
-    
-    int val = (int)(((long long)(cdf[Ii] - cdf_min) * 255) / (m - cdf_min));
-    out_I[orig[i]] = max(0, min(255, val));
+    if (m == cdf_min) { out_I[oi] = q.I; return; }
+    int val = (int)(((long long)(cdf_self - cdf_min) * 255) / (m - cdf_min));
+    out_I[oi] = max(0, min(255, val));
 }
 
 
@@ -487,37 +519,54 @@ static void write_output(const char* path,
 
 
 
-typedef struct {
-    int cell;
-    int idx;
-} SortItem;
 
-static int cmp_cells(const void* a, const void* b) {
-    int ca = ((const SortItem*)a)->cell;
-    int cb = ((const SortItem*)b)->cell;
-    return (ca > cb) - (ca < cb);
+/* ─── Build distance-sorted offset table and upload to GPU ──────────── */
+static void init_offset_table() {
+    CellOff tbl[N_OFFSETS];
+    int cnt = 0;
+    for (int dx = -SEARCH_R; dx <= SEARCH_R; dx++)
+    for (int dy = -SEARCH_R; dy <= SEARCH_R; dy++)
+    for (int dz = -SEARCH_R; dz <= SEARCH_R; dz++) {
+        int ax = abs(dx) > 1 ? abs(dx) - 1 : 0;
+        int ay = abs(dy) > 1 ? abs(dy) - 1 : 0;
+        int az = abs(dz) > 1 ? abs(dz) - 1 : 0;
+        tbl[cnt++] = { (short)dx, (short)dy, (short)dz,
+                       (short)(ax*ax + ay*ay + az*az) };
+    }
+    /* closest cells first; ties broken by L1 norm for stability */
+    std::sort(tbl, tbl + cnt, [](const CellOff& a, const CellOff& b) {
+        if (a.lb != b.lb) return a.lb < b.lb;
+        return (abs(a.dx)+abs(a.dy)+abs(a.dz)) < (abs(b.dx)+abs(b.dy)+abs(b.dz));
+    });
+    CUDA_CHECK(cudaMemcpyToSymbol(g_cell_offs, tbl,
+                                   (size_t)cnt * sizeof(CellOff)));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_n_offs, &cnt, sizeof(int)));
 }
 
 static void run_approx_knn(const Point* h_pts, int n, int k) {
-    int xmn = h_pts[0].x, xmx = xmn, ymn = h_pts[0].y, ymx = ymn, zmn = h_pts[0].z, zmx = zmn;
-    
-    // Find bounding box
+    /* ── bounding box via OpenMP reduction ─────────────────────── */
+    int xmn = h_pts[0].x, xmx = xmn;
+    int ymn = h_pts[0].y, ymx = ymn;
+    int zmn = h_pts[0].z, zmx = zmn;
+
     #pragma omp parallel for reduction(min:xmn,ymn,zmn) reduction(max:xmx,ymx,zmx)
     for (int i = 0; i < n; i++) {
-        if (h_pts[i].x < xmn) xmn = h_pts[i].x;  if (h_pts[i].x > xmx) xmx = h_pts[i].x;
-        if (h_pts[i].y < ymn) ymn = h_pts[i].y;  if (h_pts[i].y > ymx) ymx = h_pts[i].y;
-        if (h_pts[i].z < zmn) zmn = h_pts[i].z;  if (h_pts[i].z > zmx) zmx = h_pts[i].z;
+        if (h_pts[i].x < xmn) xmn = h_pts[i].x;
+        if (h_pts[i].x > xmx) xmx = h_pts[i].x;
+        if (h_pts[i].y < ymn) ymn = h_pts[i].y;
+        if (h_pts[i].y > ymx) ymx = h_pts[i].y;
+        if (h_pts[i].z < zmn) zmn = h_pts[i].z;
+        if (h_pts[i].z > zmx) zmx = h_pts[i].z;
     }
-    
+
     float lx = (float)(xmx - xmn) + 1e-5f;
     float ly = (float)(ymx - ymn) + 1e-5f;
     float lz = (float)(zmx - zmn) + 1e-5f;
 
-    // Grid sizing heuristics
     float mx_l = lx > ly ? (lx > lz ? lx : lz) : (ly > lz ? ly : lz);
-    float cpd = cbrtf(27.0f * n / (float)(k + 1));
+    float cpd  = cbrtf(27.0f * n / (float)(k + 1));
     if (cpd < 1.0f) cpd = 1.0f;
-    
+
     float vs = mx_l / cpd;
     if (vs < 1e-6f) vs = 1e-6f;
 
@@ -526,58 +575,66 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
     int Gz = (int)(lz / vs) + 1; if (Gz > 512) Gz = 512;
     long long t_cells = (long long)Gx * Gy * Gz;
 
-    SortItem* items = (SortItem*)malloc((size_t)n * sizeof(SortItem));
-
-    // Assign cells
-    #pragma omp parallel for
-    for (int i = 0; i < n; i++) {
-        int cx = (int)((h_pts[i].x - xmn) / vs); if (cx >= Gx) cx = Gx - 1;
-        int cy = (int)((h_pts[i].y - ymn) / vs); if (cy >= Gy) cy = Gy - 1;
-        int cz = (int)((h_pts[i].z - zmn) / vs); if (cz >= Gz) cz = Gz - 1;
-        items[i].cell = cx * Gy * Gz + cy * Gz + cz;
-        items[i].idx = i;
-    }
-
-    qsort(items, n, sizeof(SortItem), cmp_cells);
-
-    // Setup AoS layout using Point struct directly
-    Point* pts = (Point*)malloc((size_t)n * sizeof(Point));
-    int* orig = (int*)malloc((size_t)n * sizeof(int));
+    /* ── cell assignment (parallel) ───────────────────────────── */
+    int* cell_of = (int*)malloc((size_t)n * sizeof(int));
 
     #pragma omp parallel for
     for (int i = 0; i < n; i++) {
-        int oi = items[i].idx;
-        pts[i]  = h_pts[oi];
-        orig[i] = oi;
+        int cx = (int)((h_pts[i].x - xmn) / vs);
+        int cy = (int)((h_pts[i].y - ymn) / vs);
+        int cz = (int)((h_pts[i].z - zmn) / vs);
+        if (cx >= Gx) cx = Gx - 1;
+        if (cy >= Gy) cy = Gy - 1;
+        if (cz >= Gz) cz = Gz - 1;
+        cell_of[i] = cx * Gy * Gz + cy * Gz + cz;
     }
 
-    // Build prefix sum for cell offsets
-    int* cs = (int*)calloc((size_t)t_cells, sizeof(int));
+    /* ── counting sort by cell — O(n) vs qsort's O(n lg n) ─── */
     int* cc = (int*)calloc((size_t)t_cells, sizeof(int));
-    
-    for (int i = 0; i < n; i++) cc[items[i].cell]++;
-    for (long long c = 1; c < t_cells; c++) cs[c] = cs[c - 1] + cc[c - 1];
+    for (int i = 0; i < n; i++) cc[cell_of[i]]++;
 
+    int* cs = (int*)malloc((size_t)t_cells * sizeof(int));
+    cs[0] = 0;
+    for (long long c = 1; c < t_cells; c++)
+        cs[c] = cs[c - 1] + cc[c - 1];
+
+    int* cursor = (int*)malloc((size_t)t_cells * sizeof(int));
+    memcpy(cursor, cs, (size_t)t_cells * sizeof(int));
+
+    Point* srt_pts = (Point*)malloc((size_t)n * sizeof(Point));
+    int*   srt_org = (int*)malloc((size_t)n * sizeof(int));
+
+    for (int i = 0; i < n; i++) {
+        int pos = cursor[cell_of[i]]++;
+        srt_pts[pos] = h_pts[i];
+        srt_org[pos] = i;
+    }
+    free(cursor);
+    free(cell_of);
+
+    /* ── upload offset table to constant memory ───────────────── */
+    init_offset_table();
+
+    /* ── device allocations & H->D transfers ──────────────────── */
     Point *d_pts;
-    int *d_orig, *d_cs, *d_cc, *d_out;
+    int   *d_orig, *d_cs, *d_cc, *d_out;
     CUDA_CHECK(cudaMalloc(&d_pts,  (size_t)n * sizeof(Point)));
     CUDA_CHECK(cudaMalloc(&d_orig, (size_t)n * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cs,   (size_t)t_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cc,   (size_t)t_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_out,  (size_t)n * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_pts,  pts,  (size_t)n * sizeof(Point),     cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_orig, orig, (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_cs,   cs,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_cc,   cc,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pts,  srt_pts, (size_t)n * sizeof(Point),     cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_orig, srt_org, (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cs,   cs,      (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cc,   cc,      (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
 
     int blk = BLOCK_SZ, grd = (n + blk - 1) / blk;
-    Point grid_dim = {Gx, Gy, Gz, 0};
-    Point min_pt = {xmn, ymn, zmn, 0};
-    approx_knn<<<grd, blk>>>(
+    approx_knn_kernel<<<grd, blk>>>(
         d_pts, d_orig, n,
-        d_cs, d_cc, grid_dim, min_pt, 1.0f / vs, k, d_out);
-    
+        d_cs, d_cc, Gx, Gy, Gz,
+        xmn, ymn, zmn, 1.0f / vs, k, d_out);
+
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -586,11 +643,10 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
 
     write_output("approx_knn.txt", h_pts, h_out, n);
 
-    cudaFree(d_pts);
-    cudaFree(d_orig); cudaFree(d_cs); cudaFree(d_cc); cudaFree(d_out);
-
-    free(items); free(pts);
-    free(orig); free(cs); free(cc); free(h_out);
+    cudaFree(d_pts);   cudaFree(d_orig);
+    cudaFree(d_cs);    cudaFree(d_cc);    cudaFree(d_out);
+    free(srt_pts);     free(srt_org);
+    free(cs);          free(cc);          free(h_out);
 }
 
 
