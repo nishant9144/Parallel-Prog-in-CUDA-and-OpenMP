@@ -104,32 +104,36 @@ int equalize(const Point* pts, const int* neighbors, int k, int self_I) {
     return max(0, min(255, val));
 }
 
-__global__ void approx_knn_kernel(
-    const int* __restrict__ px, const int* __restrict__ py,
-    const int* __restrict__ pz, const int* __restrict__ pI,
+
+
+
+
+
+__global__ void approx_knn(
+    const Point* __restrict__ pts,
     const int* __restrict__ orig, int n,
     const int* __restrict__ c_start, const int* __restrict__ c_cnt,
-    int Gx, int Gy, int Gz, int x_min, int y_min, int z_min, float inv_vs,
+    Point grid_dim, Point min_pt, float inv_vs,
     int k, int* __restrict__ out_I)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    int xi = px[i], yi = py[i], zi = pz[i];
-    int cx = min(Gx - 1, max(0, (int)((xi - x_min) * inv_vs)));
-    int cy = min(Gy - 1, max(0, (int)((yi - y_min) * inv_vs)));
-    int cz = min(Gz - 1, max(0, (int)((zi - z_min) * inv_vs)));
+    int xi = pts[i].x, yi = pts[i].y, zi = pts[i].z;
+    int cx = min(grid_dim.x - 1, max(0, (int)((xi - min_pt.x) * inv_vs)));
+    int cy = min(grid_dim.y - 1, max(0, (int)((yi - min_pt.y) * inv_vs)));
+    int cz = min(grid_dim.z - 1, max(0, (int)((zi - min_pt.z) * inv_vs)));
 
-    // Float heap for low register usage, populated via exact integer math
-    float kd[128];
+    // Integer heap
+    long long kd[128];
     int ki[128];
     int cnt = 0;
-    float wD = 0.0f; int wP = 0;
+    long long wD = 0; int wP = 0;
 
     for (int r = 0; r <= 4; r++) {
-        int ax = max(0, cx - r), bx = min(Gx - 1, cx + r);
-        int ay = max(0, cy - r), by = min(Gy - 1, cy + r);
-        int az = max(0, cz - r), bz = min(Gz - 1, cz + r);
+        int ax = max(0, cx - r), bx = min(grid_dim.x - 1, cx + r);
+        int ay = max(0, cy - r), by = min(grid_dim.y - 1, cy + r);
+        int az = max(0, cz - r), bz = min(grid_dim.z - 1, cz + r);
 
         for (int gx = ax; gx <= bx; gx++)
         for (int gy = ay; gy <= by; gy++)
@@ -137,16 +141,16 @@ __global__ void approx_knn_kernel(
             // Skip inner cells already checked in smaller radius
             if (r > 0 && abs(gx - cx) < r && abs(gy - cy) < r && abs(gz - cz) < r) continue;
 
-            int cid = gx * Gy * Gz + gy * Gz + gz;
+            int cid = gx * grid_dim.y * grid_dim.z + gy * grid_dim.z + gz;
             int start = c_start[cid], c_count = c_cnt[cid];
 
             for (int t = start; t < start + c_count; t++) {
                 if (orig[t] == orig[i]) continue;
                 
-                long long dx = (long long)(px[t] - xi);
-                long long dy = (long long)(py[t] - yi);
-                long long dz = (long long)(pz[t] - zi);
-                float d = (float)(dx*dx + dy*dy + dz*dz);
+                long long dx = (long long)(pts[t].x - xi);
+                long long dy = (long long)(pts[t].y - yi);
+                long long dz = (long long)(pts[t].z - zi);
+                long long d = dx*dx + dy*dy + dz*dz;
 
                 if (cnt < k) {
                     kd[cnt] = d; ki[cnt] = t; ++cnt;
@@ -165,8 +169,8 @@ __global__ void approx_knn_kernel(
     }
 
     int hist[256] = {0};
-    hist[pI[i]]++;
-    for (int t = 0; t < cnt; t++) hist[pI[ki[t]]]++;
+    hist[pts[i].I]++;
+    for (int t = 0; t < cnt; t++) hist[pts[ki[t]].I]++;
 
     int cdf[256]; cdf[0] = hist[0];
     for (int v = 1; v < 256; v++) cdf[v] = cdf[v - 1] + hist[v];
@@ -174,7 +178,7 @@ __global__ void approx_knn_kernel(
     int cdf_min = 0;
     for (int v = 0; v < 256; v++) if (cdf[v] > 0) { cdf_min = cdf[v]; break; }
 
-    int Ii = pI[i], m = cnt + 1;
+    int Ii = pts[i].I, m = cnt + 1;
     if (m == cdf_min || m == 0) { out_I[orig[i]] = Ii; return; }
     
     int val = (int)(((long long)(cdf[Ii] - cdf_min) * 255) / (m - cdf_min));
@@ -287,6 +291,7 @@ __global__ void km_update(
                         };
     }
 }
+
 __global__ void km_hist(const Point* __restrict__ pts,
                                     const int*   __restrict__ assignments,
                                     int n,
@@ -377,6 +382,9 @@ __global__ void km_equalize(const Point* __restrict__ pts,
 
 
 
+
+
+
 __global__ void knn(const Point* __restrict__ pts,
                                    const TreeNode* __restrict__ tree,
                                    int root, int n, int k,
@@ -437,6 +445,10 @@ __global__ void knn(const Point* __restrict__ pts,
 
 
 
+
+
+
+
 static void read_input(const char* path, Point** h_pts, int* n, int* k, int* T) {
     FILE* f = fopen(path, "r");
     if (!f) { perror("fopen"); exit(EXIT_FAILURE); }
@@ -460,8 +472,6 @@ static void read_input(const char* path, Point** h_pts, int* n, int* k, int* T) 
     fclose(f);
 }
 
-
-
 static void write_output(const char* path,
                           const Point* pts, const int* intensities, int n) {
     FILE* f = fopen(path, "w");
@@ -471,6 +481,10 @@ static void write_output(const char* path,
                 pts[i].x, pts[i].y, pts[i].z, intensities[i]);
     fclose(f);
 }
+
+
+
+
 
 
 typedef struct {
@@ -526,20 +540,14 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
 
     qsort(items, n, sizeof(SortItem), cmp_cells);
 
-    // Setup SoA layout for coalesced memory access
-    int* px   = (int*)malloc((size_t)n * sizeof(int));
-    int* py   = (int*)malloc((size_t)n * sizeof(int));
-    int* pz   = (int*)malloc((size_t)n * sizeof(int));
-    int* pI   = (int*)malloc((size_t)n * sizeof(int));
+    // Setup AoS layout using Point struct directly
+    Point* pts = (Point*)malloc((size_t)n * sizeof(Point));
     int* orig = (int*)malloc((size_t)n * sizeof(int));
 
     #pragma omp parallel for
     for (int i = 0; i < n; i++) {
         int oi = items[i].idx;
-        px[i]   = h_pts[oi].x;
-        py[i]   = h_pts[oi].y;
-        pz[i]   = h_pts[oi].z;
-        pI[i]   = h_pts[oi].I;
+        pts[i]  = h_pts[oi];
         orig[i] = oi;
     }
 
@@ -550,28 +558,25 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
     for (int i = 0; i < n; i++) cc[items[i].cell]++;
     for (long long c = 1; c < t_cells; c++) cs[c] = cs[c - 1] + cc[c - 1];
 
-    int *d_px, *d_py, *d_pz, *d_pI, *d_orig, *d_cs, *d_cc, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_px,   (size_t)n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_py,   (size_t)n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pz,   (size_t)n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pI,   (size_t)n * sizeof(int)));
+    Point *d_pts;
+    int *d_orig, *d_cs, *d_cc, *d_out;
+    CUDA_CHECK(cudaMalloc(&d_pts,  (size_t)n * sizeof(Point)));
     CUDA_CHECK(cudaMalloc(&d_orig, (size_t)n * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cs,   (size_t)t_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_cc,   (size_t)t_cells * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_out,  (size_t)n * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_px,   px,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_py,   py,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pz,   pz,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pI,   pI,   (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pts,  pts,  (size_t)n * sizeof(Point),     cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_orig, orig, (size_t)n * sizeof(int),       cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_cs,   cs,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_cc,   cc,   (size_t)t_cells * sizeof(int), cudaMemcpyHostToDevice));
 
     int blk = BLOCK_SZ, grd = (n + blk - 1) / blk;
-    approx_knn_kernel<<<grd, blk>>>(
-        d_px, d_py, d_pz, d_pI, d_orig, n,
-        d_cs, d_cc, Gx, Gy, Gz, xmn, ymn, zmn, 1.0f / vs, k, d_out);
+    Point grid_dim = {Gx, Gy, Gz, 0};
+    Point min_pt = {xmn, ymn, zmn, 0};
+    approx_knn<<<grd, blk>>>(
+        d_pts, d_orig, n,
+        d_cs, d_cc, grid_dim, min_pt, 1.0f / vs, k, d_out);
     
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -581,12 +586,16 @@ static void run_approx_knn(const Point* h_pts, int n, int k) {
 
     write_output("approx_knn.txt", h_pts, h_out, n);
 
-    cudaFree(d_px); cudaFree(d_py); cudaFree(d_pz); cudaFree(d_pI);
+    cudaFree(d_pts);
     cudaFree(d_orig); cudaFree(d_cs); cudaFree(d_cc); cudaFree(d_out);
 
-    free(items); free(px); free(py); free(pz);
-    free(pI); free(orig); free(cs); free(cc); free(h_out);
+    free(items); free(pts);
+    free(orig); free(cs); free(cc); free(h_out);
 }
+
+
+
+
 
 
 
@@ -699,6 +708,11 @@ static void run_kmeans(const Point* h_pts, int n, int k, int T) {
 }
 
 
+
+
+
+
+
 static int build_tree(std::vector<int>& indices, const Point* pts,
                              int start, int end, int depth,
                              std::vector<TreeNode>& nodes) {
@@ -722,6 +736,10 @@ static int build_tree(std::vector<int>& indices, const Point* pts,
     nodes[node_idx].right = build_tree(indices, pts, mid+1, end, depth+1, nodes);
     return node_idx;
 }
+
+
+
+
 
 static void run_knn(const Point* h_pts, int n, int k) {
     std::vector<int> indices(n);
@@ -753,6 +771,11 @@ static void run_knn(const Point* h_pts, int n, int k) {
     write_output("knn.txt", h_pts, h_out, n);
     cudaFree(d_pts); cudaFree(d_tree); cudaFree(d_out); free(h_out);
 }
+
+
+
+
+
 
 int main(int argc, char** argv) {
     if (argc != 3) {

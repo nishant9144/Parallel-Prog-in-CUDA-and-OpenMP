@@ -1,0 +1,410 @@
+\documentclass[11pt,a4paper]{article}
+
+% ─── Packages ──────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+% algorithm, tikz, pgfplots removed — not used in this report
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{fancyhdr}
+
+% ─── Page Style ────────────────────────────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{PDP Assignment 2}
+\lhead{Parallel Programming using CUDA and OpenMP}
+\cfoot{\thepage}
+
+% ─── Code Listing Style ───────────────────────────────────────────────
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codegreen}{RGB}{0,128,0}
+\definecolor{codegray}{RGB}{128,128,128}
+\definecolor{codepurple}{RGB}{128,0,128}
+
+\lstset{
+    language=C++,
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue}\bfseries,
+    commentstyle=\color{codegreen}\itshape,
+    stringstyle=\color{codepurple},
+    numberstyle=\tiny\color{codegray},
+    numbers=left,
+    numbersep=5pt,
+    breaklines=true,
+    frame=single,
+    tabsize=4,
+    showstringspaces=false,
+    captionpos=b,
+    morekeywords={__global__, __device__, __shared__, __constant__, __syncthreads,
+                  __forceinline__, __restrict__, __align__,
+                  atomicAdd, atomicOr, __ballot_sync, __shfl_sync, __ffs, __popc,
+                  int4, uint8_t, int64_t, cudaMemcpy, cudaMalloc, cudaFree,
+                  cudaMemset, cudaDeviceSynchronize, cudaMemcpyToSymbolAsync,
+                  blockIdx, blockDim, threadIdx, gridDim}
+}
+
+% ─── Title ─────────────────────────────────────────────────────────────
+\title{
+    \textbf{Assignment 2: Parallel Programming using CUDA and OpenMP} \\[0.5em]
+    \large Graph-Based Local Histogram Equalization on 3D Point Clouds
+}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Introduction}
+% ═══════════════════════════════════════════════════════════════════════
+
+This report describes the implementation of \textbf{local histogram equalization} on 3D point cloud data using CUDA and OpenMP. Each point in the cloud has spatial coordinates $(x, y, z)$ and an intensity value $I \in \{0, 1, \ldots, 255\}$. The task involves computing a local histogram for each point based on its neighborhood, deriving a cumulative distribution function (CDF), and remapping intensities to enhance contrast.
+
+Three different neighborhood-definition strategies are implemented:
+\begin{enumerate}
+    \item \textbf{Exact KNN} --- using a KD-tree for exact $k$-nearest neighbor search.
+    \item \textbf{Approximate KNN} --- using a 3D spatial grid (voxel hashing) for fast approximate neighbor search.
+    \item \textbf{K-Means Clustering} --- using parallelized K-Means to group points into clusters.
+\end{enumerate}
+
+All three approaches share the same histogram equalization pipeline (local histogram $\to$ CDF $\to$ intensity remapping) but differ in how the local neighborhood $\mathcal{N}_k(i)$ is defined.
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Common Data Structures}
+% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Point Representation}
+
+Each point is stored using a 16-byte aligned struct:
+
+\begin{lstlisting}[caption={Point struct with 16-byte alignment}]
+struct __align__(16) Point {
+    int x, y, z, I;
+};
+\end{lstlisting}
+
+The \texttt{\_\_align\_\_(16)} attribute ensures that each \texttt{Point} occupies exactly 16 bytes, enabling \textbf{coalesced 128-bit memory transactions} on the GPU. When consecutive threads in a warp access consecutive points, the GPU can serve the entire warp with a minimal number of memory transactions, significantly improving global memory throughput.
+
+\subsection{Histogram Equalization Formula}
+
+For all three methods, once the local histogram $H_i[v]$ is computed, the equalized intensity is:
+\[
+    I'_i = \left\lfloor \frac{C_i[I_i] - C_{i,\min}}{m - C_{i,\min}} \times 255 \right\rfloor
+\]
+where $C_i[v] = \sum_{u=0}^{v} H_i[u]$ is the CDF, $C_{i,\min} = \min\{C_i[v] \mid C_i[v] > 0\}$, and $m$ is the neighborhood size (including the query point itself). If $m = C_{i,\min}$, the original intensity is preserved.
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Approach 1: Exact KNN}
+% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Overview}
+
+The exact KNN approach finds the $k$ nearest neighbors for every point using Euclidean distance. A KD-tree is constructed on the CPU and traversed on the GPU in parallel.
+
+\subsection{Implementation Details}
+
+\subsubsection{KD-Tree Construction (Host)}
+
+The KD-tree is built recursively on the host using \texttt{std::nth\_element} for $O(n)$ median selection at each level. Each internal node stores:
+
+\begin{lstlisting}[caption={KD-tree node structure}]
+struct TreeNode {
+    int pt_idx;        // Index of the point at this node
+    int left, right;   // Child indices (-1 if absent)
+    int axis;          // Splitting axis (0=x, 1=y, 2=z)
+};
+\end{lstlisting}
+
+The splitting axis cycles through $x \to y \to z$ with depth: $\texttt{axis} = \texttt{depth} \bmod 3$. The tree is stored as a flat array (\texttt{std::vector<TreeNode>}) for efficient GPU transfer.
+
+\subsubsection{GPU KD-Tree Traversal}
+
+Each GPU thread independently traverses the KD-tree for one query point. Key design decisions:
+
+\begin{itemize}
+    \item \textbf{Iterative traversal with explicit stack}: A fixed-size stack of depth 32 replaces recursion, which is not efficient on GPUs. Depth 32 is sufficient since $\log_2(n)$ rarely exceeds this for practical input sizes.
+
+    \item \textbf{Max-heap for $k$-best tracking}: Each thread maintains a max-heap of size $k$ in registers/local memory. The heap root always holds the \textit{worst} (farthest) neighbor, enabling $O(1)$ pruning decisions.
+
+    \item \textbf{Branch pruning}: After visiting the ``near'' child (the side of the splitting plane where the query lies), the ``far'' child is only visited if:
+    \[
+        \texttt{heap\_sz} < k \quad \text{or} \quad (\text{axis\_dist})^2 \leq \text{heap}[0].\text{dist2}
+    \]
+    This prunes large portions of the tree, reducing the average work per query from $O(n)$ to approximately $O(\log n)$.
+
+    \item \textbf{Deterministic tie-breaking}: When two points are equidistant, ties are broken lexicographically by $(x, y, z)$ coordinates to ensure reproducible results.
+\end{itemize}
+
+\subsubsection{Integrated Equalization}
+
+After KNN search, each thread immediately computes the local histogram, CDF, and equalized intensity in the \texttt{equalize()} device function. This avoids a separate kernel launch and the need to store all $n \times k$ neighbor indices in global memory.
+
+\begin{lstlisting}[caption={Inline equalization after KNN search}]
+__device__ __forceinline__
+int equalize(const Point* pts, const int* neighbors,
+             int k, int self_I) {
+    uint8_t hist[HIST_BINS] = {};
+    hist[self_I]++;
+    for (int j = 0; j < k; j++)
+        ++hist[pts[neighbors[j]].I];
+    int total = k + 1;
+    int cumsum = 0, cdf_min = 0, cdf_self = 0;
+    for (int v = 0; v < HIST_BINS; v++) {
+        cumsum += hist[v];
+        if (cdf_min == 0 && cumsum > 0) cdf_min = cumsum;
+        if (v == self_I) cdf_self = cumsum;
+    }
+    if (total == cdf_min) return self_I;
+    int val = (int)(((long long)(cdf_self - cdf_min) * 255)
+                    / (total - cdf_min));
+    return max(0, min(255, val));
+}
+\end{lstlisting}
+
+\subsection{Optimizations}
+
+\begin{itemize}
+    \item \textbf{L1 cache preference}: \texttt{cudaFuncCachePreferL1} is set for the KNN kernel since the KD-tree traversal is pointer-chasing heavy and benefits from larger L1 cache for random global memory accesses.
+    \item \textbf{Block size of 128}: A smaller block size (\texttt{KNN\_BLOCK\_SZ = 128}) is used because each thread has high register pressure (heap array, stack), allowing more threads per SM.
+    \item \textbf{Pinned host memory}: \texttt{cudaMallocHost} is used for the point array to enable faster PCIe transfers.
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Approach 2: Approximate KNN}
+% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Overview}
+
+The approximate KNN approach trades exactness for speed by using a \textbf{3D spatial grid (voxel hashing)} to restrict the neighbor search to nearby cells. Instead of searching the entire point cloud, each point only examines points within a small radius of grid cells around its own cell.
+
+\subsection{Algorithm}
+
+\begin{enumerate}
+    \item \textbf{Bounding box}: Compute the axis-aligned bounding box of all points using an OpenMP parallel reduction.
+    \item \textbf{Grid construction}: Divide the 3D space into a uniform voxel grid. The voxel size is chosen adaptively:
+    \[
+        v_s = \frac{\max(l_x, l_y, l_z)}{\sqrt[3]{27n / (k+1)}}
+    \]
+    This heuristic targets approximately $k+1$ points per cell on average, ensuring each cell has enough neighbors for the KNN query while keeping each cell small enough for locality.
+    \item \textbf{Sorting}: Points are assigned to cells and sorted by cell ID using \texttt{qsort}. A prefix-sum array records the start offset and count of points in each cell.
+    \item \textbf{GPU kernel}: Each thread searches cells in expanding concentric shells (radius 0 to 4) around its own cell. Points in previously searched (inner) shells are skipped to avoid redundant computation.
+\end{enumerate}
+
+\subsection{Implementation Details}
+
+\subsubsection{Host-Side Preprocessing}
+
+\begin{itemize}
+    \item \textbf{OpenMP parallel bounding box}: The min/max over all coordinates is computed using \texttt{\#pragma omp parallel for reduction(min:...) reduction(max:...)}.
+    \item \textbf{Cell assignment}: Each point is mapped to a cell index $(\text{cx}, \text{cy}, \text{cz})$ and linearized as $\text{cx} \times G_y \times G_z + \text{cy} \times G_z + \text{cz}$. This is parallelized with OpenMP.
+    \item \textbf{Sorting by cell}: Points are reordered so that all points in the same cell are contiguous in memory. This ensures that when the GPU kernel iterates over a cell's points, the accesses are sequential and coalesced.
+\end{itemize}
+
+\subsubsection{GPU Kernel}
+
+The kernel maintains a simple linear $k$-best list (arrays \texttt{kd[128]} for distances and \texttt{ki[128]} for indices). When the list is full, a new point replaces the current worst if it is closer. The worst is tracked by a linear scan over the $k$ entries.
+
+\begin{lstlisting}[caption={Expanding shell search in approximate KNN}]
+for (int r = 0; r <= 4; r++) {
+    // Iterate over cells in shell of radius r
+    for (int gx = ax; gx <= bx; gx++)
+    for (int gy = ay; gy <= by; gy++)
+    for (int gz = az; gz <= bz; gz++) {
+        // Skip inner cells already visited
+        if (r > 0 && abs(gx-cx)<r && abs(gy-cy)<r
+                   && abs(gz-cz)<r) continue;
+        // Search all points in this cell
+        ...
+    }
+    if (r >= 2 && cnt == k) break; // Early exit
+}
+\end{lstlisting}
+
+\textbf{Early termination}: If $k$ neighbors have been found by radius $\geq 2$, the search stops. This is the key to the speedup --- most points find their neighbors within a small radius.
+
+\subsubsection{Inline Equalization}
+
+Similar to the exact KNN kernel, histogram computation, CDF, and intensity remapping are performed inline within the same kernel to avoid extra global memory traffic.
+
+\subsection{Trade-offs: Accuracy vs.\ Speed}
+
+\begin{itemize}
+    \item \textbf{Accuracy}: The grid-based approach is approximate because the search may miss true $k$-nearest neighbors that lie in cells beyond the maximum search radius. The quality depends on:
+    \begin{itemize}
+        \item The voxel size (too large $\Rightarrow$ too many candidates; too small $\Rightarrow$ may miss neighbors).
+        \item The maximum radius (capped at 4 shells).
+        \item The spatial distribution of points (uniform distributions favor this approach).
+    \end{itemize}
+    \item \textbf{Speed}: By restricting the search space to a small number of cells, the per-point work is reduced from $O(n)$ (brute-force) or $O(\log n)$ (KD-tree) to $O(c)$ where $c$ is the number of points in nearby cells. For well-distributed data, $c \approx O(k)$.
+    \item \textbf{Grid sizing heuristic}: The cube-root formula $\sqrt[3]{27n/(k+1)}$ ensures that each cell contains on the order of $(k+1)/27$ points, so a $3 \times 3 \times 3$ neighborhood (radius 1) typically contains enough neighbors. The factor of 27 accounts for the 27 cells in a radius-1 cube.
+\end{itemize}
+
+The algorithm is specifically chosen for its parallelizability --- each point's search is entirely independent, with no synchronization or shared mutable state between threads, making it ideal for GPU execution.
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Approach 3: K-Means Clustering}
+% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Overview}
+
+In the K-Means approach, the neighborhood of a point is defined as all points belonging to the same cluster. The algorithm performs iterative assignment and centroid update until convergence or $T$ iterations, followed by per-cluster histogram equalization.
+
+\subsection{Implementation Details}
+
+The K-Means pipeline consists of five GPU kernels:
+
+\subsubsection{Kernel 1: Cluster Assignment (\texttt{asgn\_cluster})}
+
+This is the most performance-critical kernel and uses several optimizations:
+
+\begin{itemize}
+    \item \textbf{Constant memory for centroids}: Centroids are stored in \texttt{\_\_constant\_\_} memory (\texttt{dc\_cent[128]}), which is cached and broadcast to all threads in a warp simultaneously. Since every thread reads the same centroid during distance computation, this exploits the broadcast capability of constant memory.
+
+    \item \textbf{Warp-level shared memory accumulation}: Instead of having every thread atomically update global accumulators, each warp accumulates partial sums for centroid coordinates $(x, y, z)$ and counts in shared memory. After the block completes, partial sums are reduced across warps and then atomically added to global accumulators. This reduces the number of global atomics by a factor of 32 (warp size).
+
+    \item \textbf{Convergence detection}: An \texttt{atomicOr} on a global flag detects whether any point changed its assignment, enabling early termination.
+
+    \item \textbf{Deterministic tie-breaking}: When two centroids are equidistant, the one with lexicographically smaller $(x, y, z)$ coordinates is chosen.
+\end{itemize}
+
+\begin{lstlisting}[caption={Shared memory layout for warp-level accumulation}]
+extern __shared__ int smem[];
+int* sx = smem;                       // x sums per warp
+int* sy = smem + n_warp * k;          // y sums per warp
+int* sz = smem + 2 * n_warp * k;      // z sums per warp
+int* sc = smem + 3 * n_warp * k;      // counts per warp
+\end{lstlisting}
+
+\subsubsection{Kernel 2: Centroid Update (\texttt{km\_update})}
+
+A simple kernel that divides accumulated sums by counts to compute new centroids. One thread per cluster.
+
+\subsubsection{Kernel 3: Cluster Histogram (\texttt{km\_hist})}
+
+This kernel uses \textbf{warp-level primitives} for efficient histogram construction:
+
+\begin{itemize}
+    \item \texttt{\_\_ballot\_sync}: Creates a bitmask of threads with the same (cluster, intensity) key.
+    \item \texttt{\_\_shfl\_sync}: Broadcasts keys across the warp for comparison.
+    \item \texttt{\_\_popc}: Counts the number of matching threads (population count).
+\end{itemize}
+
+Instead of each thread issuing an individual \texttt{atomicAdd}, threads with the same key are grouped and a single \texttt{atomicAdd} is performed with the aggregated count. This reduces atomic contention by up to $32\times$.
+
+\begin{lstlisting}[caption={Warp-level histogram aggregation}]
+unsigned remaining = mask;
+while (remaining) {
+    int src = __ffs(remaining) - 1;
+    int src_key = __shfl_sync(mask, key, src);
+    unsigned same = __ballot_sync(mask, key == src_key);
+    if (lane == src)
+        atomicAdd(&cluster_hist[cluster*256 + intensity],
+                  __popc(same));
+    remaining &= ~same;
+}
+\end{lstlisting}
+
+\subsubsection{Kernel 4: CDF Computation (\texttt{cdf})}
+
+One thread per cluster computes the prefix sum over the 256-bin histogram. Since $k$ (number of clusters) is typically small ($\leq 128$), this kernel launches few threads but each does a serial scan of 256 elements, which is efficient.
+
+\subsubsection{Kernel 5: Intensity Remapping (\texttt{km\_equalize})}
+
+Each thread reads its cluster assignment, looks up the precomputed CDF and $C_{\min}$, and applies the equalization formula. Fully parallel with no inter-thread dependencies.
+
+\subsection{Optimizations}
+
+\begin{itemize}
+    \item \textbf{Shared memory cache preference}: \texttt{cudaFuncCachePreferShared} is set for the assignment kernel since it makes heavy use of shared memory for warp-level accumulation.
+    \item \textbf{Asynchronous memsets}: \texttt{cudaMemsetAsync} is used to overlap zeroing of accumulators with kernel execution.
+    \item \textbf{Pinned memory}: Centroids use \texttt{cudaMallocHost} for faster host-device transfers during the iterative loop.
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Runtime Analysis}
+% ═══════════════════════════════════════════════════════════════════════
+
+\subsection{Computational Complexity}
+
+Table~\ref{tab:complexity} summarizes the theoretical per-point complexity of each approach.
+
+\begin{table}[H]
+    \centering
+    \caption{Asymptotic per-point complexity comparison}
+    \label{tab:complexity}
+    \begin{tabular}{@{}lccc@{}}
+        \toprule
+        \textbf{Phase} & \textbf{Exact KNN} & \textbf{Approx KNN} & \textbf{K-Means} \\
+        \midrule
+        Preprocessing  & $O(n \log n)$ (tree build) & $O(n \log n)$ (sort) & --- \\
+        Neighbor Search & $O(\log n)$ avg & $O(c)$ & $O(k)$ per iter $\times T$ \\
+        Equalization    & $O(k + 256)$ & $O(k + 256)$ & $O(256)$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Here $c$ denotes the average number of candidate points examined in the approximate KNN grid cells, and $T$ is the number of K-Means iterations.
+
+\subsection{Expected Performance Characteristics}
+
+\begin{itemize}
+    \item \textbf{Exact KNN}: The KD-tree traversal involves \textit{pointer-chasing} (random memory accesses following tree pointers), which is inherently unfriendly to GPU architectures. Each thread may follow a different path through the tree, leading to \textbf{warp divergence}. However, the aggressive pruning of the ``far'' subtree keeps the average number of nodes visited manageable.
+
+    \item \textbf{Approximate KNN}: The grid-based approach exhibits better \textbf{memory locality} --- points in the same cell are contiguous in memory due to the sorting step. Threads processing nearby points tend to access the same cells, benefiting from the L1/L2 cache. The fixed maximum radius (4) bounds the worst-case work per thread, reducing warp divergence compared to KD-tree traversal.
+
+    \item \textbf{K-Means}: The assignment kernel has the most \textbf{regular memory access pattern} --- all threads read the same centroids (broadcast via constant memory) and write to a small number of accumulators. The histogram and equalization are performed as a single pass after clustering converges. The total runtime depends heavily on the number of iterations $T$ needed for convergence.
+\end{itemize}
+
+\subsection{Comparative Summary}
+
+\begin{table}[H]
+    \centering
+    \caption{Qualitative comparison of the three approaches}
+    \label{tab:comparison}
+    \begin{tabular}{@{}lccc@{}}
+        \toprule
+        \textbf{Property} & \textbf{Exact KNN} & \textbf{Approx KNN} & \textbf{K-Means} \\
+        \midrule
+        Accuracy           & Exact  & Approximate & Different model \\
+        Memory locality    & Poor (tree)  & Good (sorted grid) & Excellent (broadcast) \\
+        Warp divergence    & High   & Moderate & Low \\
+        GPU parallelism    & Good   & Excellent & Excellent \\
+        Preprocessing cost & KD-tree build & Sort + grid & None \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The approximate KNN is expected to provide the best practical speedup over exact KNN due to its bounded search space and better memory access patterns. K-Means benefits from the most regular computation but produces a fundamentally different neighborhood definition (cluster-based vs.\ distance-based).
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{OpenMP Usage}
+% ═══════════════════════════════════════════════════════════════════════
+
+OpenMP is used for host-side preprocessing to minimize CPU bottlenecks:
+
+\begin{itemize}
+    \item \textbf{Bounding box computation}: \texttt{\#pragma omp parallel for reduction(min/max:...)} computes the spatial extents in parallel.
+    \item \textbf{Cell assignment}: Mapping points to grid cells is embarrassingly parallel and uses \texttt{\#pragma omp parallel for}.
+    \item \textbf{Data reordering}: After sorting, the permuted point and original-index arrays are constructed in parallel.
+    \item \textbf{Timing}: \texttt{omp\_get\_wtime()} provides wall-clock timing for performance measurement.
+\end{itemize}
+
+% ═══════════════════════════════════════════════════════════════════════
+\section{Conclusion}
+% ═══════════════════════════════════════════════════════════════════════
+
+This report presented three parallelized approaches to local histogram equalization on 3D point clouds using CUDA and OpenMP. The exact KNN method uses a KD-tree for guaranteed correctness but suffers from irregular memory access patterns on the GPU. The approximate KNN method achieves significant speedup by trading exact correctness for spatial locality through grid-based search, while still producing results close to the ground truth. The K-Means approach provides the most GPU-friendly computation pattern by defining neighborhoods as clusters, leveraging constant memory broadcasts and warp-level primitives for efficient histogram construction.
+
+Each approach demonstrates different trade-offs in the parallelization of spatial queries on GPU architectures --- from the irregular, pointer-chasing nature of tree traversals to the highly regular, broadcast-friendly pattern of centroid-based assignment.
+
+\end{document}
